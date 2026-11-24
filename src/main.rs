@@ -16,6 +16,12 @@ use tokio::net::TcpStream;
 use tokio::sync::watch;
 use url::Url;
 
+const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+const GITHUB_REPO_URL: &str = "https://github.com/NetForgeDev/CipherForge";
+const GITHUB_RELEASES_URL: &str = "https://github.com/NetForgeDev/CipherForge/releases/latest";
+const GITHUB_API_LATEST: &str = "https://api.github.com/repos/NetForgeDev/CipherForge/releases/latest";
+const XRAY_FORK_URL: &str = "https://github.com/patterniha/Xray-core/releases";
+
 const DEFAULT_FINALMASK_STR: &str = r#"{"tcp":[{"type":"fragment","settings":{"packets":"tlshello","lengths":["0","104","1"],"delays":["0"],"maxSplit":"0"}},{"type":"fragment","settings":{"packets":"1-1","lengths":["114","1"],"delays":["1"],"maxSplit":"11"}}]}"#;
 
 const REFERENCE_CIPHER: &str = "TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:TLS_AES_128_GCM_SHA256:TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384:TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384:TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256:TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256:TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256:TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256:TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA:TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA:TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256:TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256";
@@ -138,6 +144,14 @@ enum WorkerMsg {
     Finished { stopped: bool },
 }
 
+enum UpdateState {
+    Idle,
+    Checking,
+    UpToDate(String),
+    Available { tag: String, url: String },
+    Error(String),
+}
+
 #[derive(Clone)]
 struct ScanParams {
     xray_path: PathBuf,
@@ -156,7 +170,7 @@ struct ScanParams {
     ul_url: String,
 }
 
-// ================= Path Discovery =================
+// ================= Path Discovery & Update Check =================
 fn resolve_base_dir() -> PathBuf {
     let bin_name = if cfg!(windows) { "xray.exe" } else { "xray" };
     if let Ok(exe) = std::env::current_exe()
@@ -174,6 +188,62 @@ fn resolve_base_dir() -> PathBuf {
         .ok()
         .and_then(|p| p.parent().map(|d| d.to_path_buf()))
         .unwrap_or_else(|| PathBuf::from("."))
+}
+
+fn parse_semver(s: &str) -> (u64, u64, u64) {
+    let clean = s.trim().trim_start_matches(['v', 'V']);
+    let mut parts = clean.split('.').map(|p| {
+        p.chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect::<String>()
+            .parse::<u64>()
+            .unwrap_or(0)
+    });
+    (
+        parts.next().unwrap_or(0),
+        parts.next().unwrap_or(0),
+        parts.next().unwrap_or(0),
+    )
+}
+
+fn spawn_update_check(tx: Sender<Result<(String, String), String>>) {
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build();
+        let res = match rt {
+            Ok(rt) => rt.block_on(async {
+                let client = reqwest::Client::builder()
+                    .user_agent(format!("CipherForge/{APP_VERSION}"))
+                    .timeout(Duration::from_secs(10))
+                    .build()
+                    .map_err(|e| e.to_string())?;
+                let resp = client
+                    .get(GITHUB_API_LATEST)
+                    .send()
+                    .await
+                    .map_err(|e| format!("Network error: {e}"))?;
+                if !resp.status().is_success() {
+                    return Err(format!("GitHub API HTTP {}", resp.status()));
+                }
+                let body = resp.bytes().await.map_err(|e| e.to_string())?;
+                let data: Value = serde_json::from_slice(&body).map_err(|e| e.to_string())?;
+                let tag = data
+                    .get("tag_name")
+                    .and_then(|v| v.as_str())
+                    .ok_or("No tag_name in release response")?
+                    .to_string();
+                let url = data
+                    .get("html_url")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(GITHUB_RELEASES_URL)
+                    .to_string();
+                Ok((tag, url))
+            }),
+            Err(e) => Err(e.to_string()),
+        };
+        let _ = tx.send(res);
+    });
 }
 
 // ================= Proxy Link Parser & Exporter =================
@@ -1420,6 +1490,9 @@ struct CipherStudioApp {
     xray_path: PathBuf,
     proxy_input: String,
     expand_link: bool,
+    expand_fm: bool,
+    hide_settings: bool,
+    show_about: bool,
     parsed_summary: Result<String, String>,
 
     target_found: usize,
@@ -1448,6 +1521,9 @@ struct CipherStudioApp {
 
     rx: Option<Receiver<WorkerMsg>>,
     stop_tx: Option<watch::Sender<bool>>,
+
+    update_state: UpdateState,
+    update_rx: Option<Receiver<Result<(String, String), String>>>,
 }
 
 impl CipherStudioApp {
@@ -1475,6 +1551,9 @@ impl CipherStudioApp {
             xray_path: xray_path.clone(),
             proxy_input: String::new(),
             expand_link: false,
+            expand_fm: false,
+            hide_settings: false,
+            show_about: false,
             parsed_summary: Err("Waiting for a proxy link (vless://, trojan://, vmess://)...".into()),
             target_found: 5,
             max_attempts: 40,
@@ -1497,8 +1576,10 @@ impl CipherStudioApp {
             results: Vec::new(),
             rx: None,
             stop_tx: None,
+            update_state: UpdateState::Idle,
+            update_rx: None,
         };
-        app.push_log(format!("Ready. Looking for Xray at: {}", xray_path.display()), LogLevel::Info);
+        app.push_log(format!("CipherForge v{APP_VERSION} ready. Xray: {}", xray_path.display()), LogLevel::Info);
         app.push_log("Paste a VLESS / Trojan / VMess link above and click 'Start Search'.", LogLevel::Info);
         app
     }
@@ -1521,6 +1602,16 @@ impl CipherStudioApp {
             return;
         }
         self.parsed_summary = parse_proxy_input(&self.proxy_input).map(|(_, s)| s);
+    }
+
+    fn trigger_update_check(&mut self) {
+        if matches!(self.update_state, UpdateState::Checking) {
+            return;
+        }
+        self.update_state = UpdateState::Checking;
+        let (tx, rx) = mpsc::channel();
+        self.update_rx = Some(rx);
+        spawn_update_check(tx);
     }
 
     fn poll_worker(&mut self) {
@@ -1549,6 +1640,27 @@ impl CipherStudioApp {
         if finished {
             self.rx = None;
             self.stop_tx = None;
+        }
+
+        if let Some(urx) = &self.update_rx
+            && let Ok(res) = urx.try_recv()
+        {
+            self.update_rx = None;
+            match res {
+                Ok((tag, url)) => {
+                    if parse_semver(&tag) > parse_semver(APP_VERSION) {
+                        self.push_log(format!("Update available: {tag} -> {url}"), LogLevel::Warn);
+                        self.update_state = UpdateState::Available { tag, url };
+                    } else {
+                        self.push_log(format!("CipherForge is up to date (v{APP_VERSION})."), LogLevel::Info);
+                        self.update_state = UpdateState::UpToDate(tag);
+                    }
+                }
+                Err(e) => {
+                    self.push_log(format!("Update check failed: {e}"), LogLevel::Warn);
+                    self.update_state = UpdateState::Error(e);
+                }
+            }
         }
     }
 
@@ -1644,7 +1756,7 @@ impl CipherStudioApp {
             fill: BG_CARD,
             stroke: egui::Stroke::new(1.0, BORDER_CLR),
             corner_radius: egui::CornerRadius::same(8),
-            inner_margin: egui::Margin::same(12),
+            inner_margin: egui::Margin::symmetric(10, 7),
             ..Default::default()
         }
     }
@@ -1654,30 +1766,106 @@ impl CipherStudioApp {
             fill: BG_CARD2,
             stroke: egui::Stroke::new(1.0, BORDER_CLR),
             corner_radius: egui::CornerRadius::same(7),
-            inner_margin: egui::Margin::symmetric(12, 8),
+            inner_margin: egui::Margin::symmetric(10, 5),
             ..Default::default()
         }
         .show(ui, |ui| {
             ui.set_min_width(ui.available_width());
             ui.horizontal(|ui| {
-                let (rect, _) = ui.allocate_exact_size(egui::vec2(4.0, 30.0), egui::Sense::hover());
+                let (rect, _) = ui.allocate_exact_size(egui::vec2(3.5, 24.0), egui::Sense::hover());
                 ui.painter().rect_filled(rect, egui::CornerRadius::same(2), accent);
                 ui.add_space(4.0);
                 ui.vertical(|ui| {
-                    ui.label(egui::RichText::new(label).size(9.5).color(FG_MUTED).strong());
-                    ui.label(egui::RichText::new(value).size(14.5).color(FG_TEXT).strong());
+                    ui.label(egui::RichText::new(label).size(9.0).color(FG_MUTED).strong());
+                    ui.label(egui::RichText::new(value).size(13.5).color(FG_TEXT).strong());
                 });
             });
         });
+    }
+
+    fn draw_about_window(&mut self, ctx: &egui::Context) {
+        if !self.show_about {
+            return;
+        }
+        let mut open = self.show_about;
+        egui::Window::new("About CipherForge")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .fixed_size([430.0, 240.0])
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("CipherForge").size(20.0).color(FG_TEXT).strong());
+                    ui.label(egui::RichText::new(format!("v{APP_VERSION}")).size(12.0).color(SKY).strong());
+                });
+                ui.label(
+                    egui::RichText::new("TLS Cipher Suite Scanner & Evolutionary Optimizer for the F&F Method")
+                        .size(11.5)
+                        .color(FG_MUTED),
+                );
+                ui.add_space(8.0);
+                ui.separator();
+                ui.add_space(6.0);
+
+                ui.horizontal(|ui| {
+                    ui.label("Project Repository:");
+                    ui.hyperlink_to("github.com/NetForgeDev/CipherForge", GITHUB_REPO_URL);
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Releases & Downloads:");
+                    ui.hyperlink_to("Latest Windows Portable Releases", GITHUB_RELEASES_URL);
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Compatible Xray Core:");
+                    ui.hyperlink_to("patterniha/Xray-core", XRAY_FORK_URL);
+                });
+
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    let checking = matches!(self.update_state, UpdateState::Checking);
+                    if ui
+                        .add_enabled(!checking, egui::Button::new("Check for Updates").fill(INDIGO))
+                        .clicked()
+                    {
+                        self.trigger_update_check();
+                    }
+
+                    match &self.update_state {
+                        UpdateState::Idle => {
+                            ui.label(egui::RichText::new("Click to check GitHub for updates.").color(FG_MUTED).size(11.0));
+                        }
+                        UpdateState::Checking => {
+                            ui.label(egui::RichText::new("Checking GitHub API...").color(SKY).size(11.0));
+                        }
+                        UpdateState::UpToDate(tag) => {
+                            ui.label(egui::RichText::new(format!("Up to date ({tag})")).color(EMERALD_HI).size(11.0).strong());
+                        }
+                        UpdateState::Available { tag, url } => {
+                            ui.label(egui::RichText::new(format!("New version: {tag}!")).color(AMBER).size(11.0).strong());
+                            if ui.add(egui::Button::new("Download").fill(EMERALD)).clicked() {
+                                ui.ctx().open_url(egui::OpenUrl::new_tab(url));
+                            }
+                        }
+                        UpdateState::Error(e) => {
+                            ui.label(egui::RichText::new(e).color(ROSE_HI).size(10.5));
+                        }
+                    }
+                });
+            });
+        self.show_about = open;
     }
 }
 
 impl eframe::App for CipherStudioApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.poll_worker();
-        if self.is_running {
+        if self.is_running || matches!(self.update_state, UpdateState::Checking) {
             ui.ctx().request_repaint_after(Duration::from_millis(80));
         }
+
+        self.draw_about_window(ui.ctx());
 
         let best_ping = self
             .results
@@ -1702,22 +1890,30 @@ impl eframe::App for CipherStudioApp {
         egui::CentralPanel::default()
             .frame(egui::Frame {
                 fill: BG_MAIN,
-                inner_margin: egui::Margin::same(14),
+                inner_margin: egui::Margin::same(10),
                 ..Default::default()
             })
             .show(ui, |ui| {
                 // ---- Header Row ----
                 ui.horizontal(|ui| {
                     ui.vertical(|ui| {
-                        ui.label(
-                            egui::RichText::new("CipherForge")
-                                .size(19.0)
-                                .color(FG_TEXT)
-                                .strong(),
-                        );
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new("CipherForge")
+                                    .size(18.0)
+                                    .color(FG_TEXT)
+                                    .strong(),
+                            );
+                            ui.label(
+                                egui::RichText::new(format!("v{APP_VERSION}"))
+                                    .size(10.5)
+                                    .color(SKY)
+                                    .strong(),
+                            );
+                        });
                         ui.label(
                             egui::RichText::new("TLS Cipher Scanner & Evolutionary Optimizer for the F&F Method")
-                                .size(11.0)
+                                .size(10.5)
                                 .color(FG_MUTED),
                         );
                     });
@@ -1737,16 +1933,55 @@ impl eframe::App for CipherStudioApp {
                             fill: status_bg,
                             stroke: egui::Stroke::new(1.0, BORDER_CLR),
                             corner_radius: egui::CornerRadius::same(7),
-                            inner_margin: egui::Margin::symmetric(14, 8),
+                            inner_margin: egui::Margin::symmetric(12, 6),
                             ..Default::default()
                         }
                         .show(ui, |ui| {
-                            ui.label(egui::RichText::new(&self.status_label).size(11.5).color(status_fg).strong());
+                            ui.label(egui::RichText::new(&self.status_label).size(11.0).color(status_fg).strong());
                         });
+
+                        if ui.button("About").clicked() {
+                            self.show_about = true;
+                        }
+
+                        let upd_btn_txt = match &self.update_state {
+                            UpdateState::Checking => "Checking...",
+                            UpdateState::Available { tag, .. } => {
+                                // Show badge text
+                                let _ = tag;
+                                "Update Found!"
+                            }
+                            _ => "Updates",
+                        };
+                        let upd_fill = if matches!(self.update_state, UpdateState::Available { .. }) {
+                            AMBER
+                        } else {
+                            BG_CARD2
+                        };
+                        let upd_fg = if matches!(self.update_state, UpdateState::Available { .. }) {
+                            BG_MAIN
+                        } else {
+                            FG_TEXT
+                        };
+                        if ui
+                            .add(egui::Button::new(egui::RichText::new(upd_btn_txt).color(upd_fg)).fill(upd_fill))
+                            .clicked()
+                        {
+                            if let UpdateState::Available { url, .. } = &self.update_state {
+                                ui.ctx().open_url(egui::OpenUrl::new_tab(url));
+                            } else {
+                                self.show_about = true;
+                                self.trigger_update_check();
+                            }
+                        }
+
+                        if ui.button("GitHub").clicked() {
+                            ui.ctx().open_url(egui::OpenUrl::new_tab(GITHUB_REPO_URL));
+                        }
                     });
                 });
 
-                ui.add_space(8.0);
+                ui.add_space(5.0);
 
                 // ---- 4 Equal-Width KPI Cards ----
                 ui.columns(4, |cols| {
@@ -1756,237 +1991,249 @@ impl eframe::App for CipherStudioApp {
                     Self::draw_kpi(&mut cols[3], "BEST UPLOAD", &best_ul, PURPLE);
                 });
 
-                ui.add_space(10.0);
+                ui.add_space(6.0);
 
-                // ---- Proxy Link Card ----
-                Self::card_frame().show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            egui::RichText::new("PROXY LINK  (Paste VLESS / Trojan / VMess share link — or JSON)")
-                                .size(11.0)
-                                .color(SKY)
-                                .strong(),
-                        );
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            let xray_ok = self.xray_path.exists();
-                            let x_clr = if xray_ok { EMERALD_HI } else { ROSE_HI };
-                            if ui
-                                .button(egui::RichText::new(if xray_ok { "Xray: Ready" } else { "Pick xray.exe" }).color(x_clr).size(11.0))
-                                .clicked()
-                                && let Some(p) = rfd::FileDialog::new().pick_file()
-                            {
-                                self.xray_path = p;
-                            }
-
-                            if ui.button(if self.expand_link { "Compact" } else { "Expand" }).clicked() {
-                                self.expand_link = !self.expand_link;
-                            }
-                            if ui.button("Load .json").clicked()
-                                && let Some(path) = rfd::FileDialog::new().add_filter("JSON", &["json"]).pick_file()
-                                && let Ok(content) = std::fs::read_to_string(&path)
-                            {
-                                if let Ok(obj) = serde_json::from_str::<Value>(&content)
-                                    && let Some(outs) = obj.get("outbounds").and_then(|v| v.as_array())
+                if !self.hide_settings {
+                    // ---- Proxy Link Card ----
+                    Self::card_frame().show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new("PROXY LINK  (Paste VLESS / Trojan / VMess share link — or JSON)")
+                                    .size(10.5)
+                                    .color(SKY)
+                                    .strong(),
+                            );
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                let xray_ok = self.xray_path.exists();
+                                let x_clr = if xray_ok { EMERALD_HI } else { ROSE_HI };
+                                if ui
+                                    .button(egui::RichText::new(if xray_ok { "Xray: Ready" } else { "Pick xray.exe" }).color(x_clr).size(10.5))
+                                    .clicked()
+                                    && let Some(p) = rfd::FileDialog::new().pick_file()
                                 {
-                                    for o in outs {
-                                        if let Some(s) = o.get("streamSettings")
-                                            && let Some(fm) = s.get("finalmask").or_else(|| s.get("finalMask"))
-                                        {
-                                            self.fm_input = fm.to_string();
-                                            break;
+                                    self.xray_path = p;
+                                }
+
+                                if ui.button(if self.expand_link { "Compact" } else { "Expand" }).clicked() {
+                                    self.expand_link = !self.expand_link;
+                                }
+                                if ui.button("Load .json").clicked()
+                                    && let Some(path) = rfd::FileDialog::new().add_filter("JSON", &["json"]).pick_file()
+                                    && let Ok(content) = std::fs::read_to_string(&path)
+                                {
+                                    if let Ok(obj) = serde_json::from_str::<Value>(&content)
+                                        && let Some(outs) = obj.get("outbounds").and_then(|v| v.as_array())
+                                    {
+                                        for o in outs {
+                                            if let Some(s) = o.get("streamSettings")
+                                                && let Some(fm) = s.get("finalmask").or_else(|| s.get("finalMask"))
+                                            {
+                                                self.fm_input = fm.to_string();
+                                                break;
+                                            }
                                         }
                                     }
+                                    self.proxy_input = content;
+                                    self.refresh_proxy_badge();
                                 }
-                                self.proxy_input = content;
-                                self.refresh_proxy_badge();
-                            }
-                            if ui
-                                .add(egui::Button::new(egui::RichText::new("Paste").color(FG_TEXT)).fill(INDIGO))
-                                .clicked()
-                                && let Ok(mut cb) = arboard::Clipboard::new()
-                                && let Ok(txt) = cb.get_text()
-                            {
-                                self.proxy_input = txt.trim().to_string();
-                                self.refresh_proxy_badge();
-                            }
-                        });
-                    });
-
-                    ui.add_space(4.0);
-                    let mut changed = false;
-                    if self.expand_link {
-                        egui::ScrollArea::vertical()
-                            .id_salt("proxy_expand_scroll")
-                            .max_height(84.0)
-                            .show(ui, |ui| {
                                 if ui
-                                    .add(
-                                        egui::TextEdit::multiline(&mut self.proxy_input)
-                                            .desired_rows(4)
-                                            .desired_width(f32::INFINITY)
-                                            .hint_text("vless://...  or  trojan://...  or  vmess://...")
-                                            .font(egui::TextStyle::Monospace),
-                                    )
-                                    .changed()
+                                    .add(egui::Button::new(egui::RichText::new("Paste").color(FG_TEXT)).fill(INDIGO))
+                                    .clicked()
+                                    && let Ok(mut cb) = arboard::Clipboard::new()
+                                    && let Ok(txt) = cb.get_text()
                                 {
-                                    changed = true;
+                                    self.proxy_input = txt.trim().to_string();
+                                    self.refresh_proxy_badge();
                                 }
                             });
-                    } else if ui
-                        .add(
-                            egui::TextEdit::singleline(&mut self.proxy_input)
-                                .desired_width(f32::INFINITY)
-                                .hint_text("vless://...  or  trojan://...  or  vmess://...")
-                                .font(egui::TextStyle::Monospace),
-                        )
-                        .changed()
-                    {
-                        changed = true;
-                    }
-                    if changed {
-                        self.refresh_proxy_badge();
-                    }
-
-                    ui.add_space(4.0);
-                    match &self.parsed_summary {
-                        Ok(s) => ui.label(egui::RichText::new(format!("[OK]  {s}")).size(11.0).color(EMERALD_HI).strong()),
-                        Err(e) => {
-                            let clr = if self.proxy_input.trim().is_empty() { FG_MUTED } else { ROSE_HI };
-                            ui.label(egui::RichText::new(format!("[!]  {e}")).size(11.0).color(clr))
-                        }
-                    };
-                });
-
-                ui.add_space(8.0);
-
-                // ---- Middle 2 Columns: Strategy & Endpoints ----
-                ui.columns(2, |cols| {
-                    Self::card_frame().show(&mut cols[0], |ui| {
-                        ui.label(egui::RichText::new("SCAN & GENERATION ENGINE").size(11.0).color(INDIGO).strong());
-                        ui.add_space(6.0);
-                        egui::Grid::new("scan_grid").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
-                            ui.label("Target working ciphers (0 = no limit):");
-                            ui.add(egui::DragValue::new(&mut self.target_found).range(0..=500));
-                            ui.end_row();
-
-                            ui.label("Max attempts:");
-                            ui.add(egui::DragValue::new(&mut self.max_attempts).range(1..=1000));
-                            ui.end_row();
-
-                            ui.label("HTTP timeout (sec):");
-                            ui.add(egui::DragValue::new(&mut self.timeout_secs).range(3..=60));
-                            ui.end_row();
                         });
 
-                        ui.add_space(6.0);
-                        ui.label(egui::RichText::new("Generation engine:").size(11.0).color(FG_MUTED));
-                        egui::ComboBox::from_id_salt("strategy_cb")
-                            .width(ui.available_width())
-                            .selected_text(self.strategy.label())
-                            .show_ui(ui, |ui| {
-                                for s in Strategy::ALL {
-                                    ui.selectable_value(&mut self.strategy, s, s.label());
-                                }
-                            });
+                        ui.add_space(3.0);
+                        let mut changed = false;
+                        if self.expand_link {
+                            egui::ScrollArea::vertical()
+                                .id_salt("proxy_expand_scroll")
+                                .max_height(78.0)
+                                .show(ui, |ui| {
+                                    if ui
+                                        .add(
+                                            egui::TextEdit::multiline(&mut self.proxy_input)
+                                                .desired_rows(4)
+                                                .desired_width(f32::INFINITY)
+                                                .hint_text("vless://...  or  trojan://...  or  vmess://...")
+                                                .font(egui::TextStyle::Monospace),
+                                        )
+                                        .changed()
+                                    {
+                                        changed = true;
+                                    }
+                                });
+                        } else if ui
+                            .add(
+                                egui::TextEdit::singleline(&mut self.proxy_input)
+                                    .desired_width(f32::INFINITY)
+                                    .hint_text("vless://...  or  trojan://...  or  vmess://...")
+                                    .font(egui::TextStyle::Monospace),
+                            )
+                            .changed()
+                        {
+                            changed = true;
+                        }
+                        if changed {
+                            self.refresh_proxy_badge();
+                        }
 
-                        ui.add_space(4.0);
-                        ui.checkbox(&mut self.run_ref, "Run [REF] F&F baseline benchmark first");
+                        ui.add_space(2.0);
+                        match &self.parsed_summary {
+                            Ok(s) => ui.label(egui::RichText::new(format!("[OK]  {s}")).size(10.5).color(EMERALD_HI).strong()),
+                            Err(e) => {
+                                let clr = if self.proxy_input.trim().is_empty() { FG_MUTED } else { ROSE_HI };
+                                ui.label(egui::RichText::new(format!("[!]  {e}")).size(10.5).color(clr))
+                            }
+                        };
                     });
 
-                    Self::card_frame().show(&mut cols[1], |ui| {
-                        ui.label(egui::RichText::new("TEST ENDPOINTS  (Worker-Safe vs Direct/VPS)").size(11.0).color(PURPLE).strong());
-                        ui.add_space(6.0);
+                    ui.add_space(5.0);
 
-                        ui.horizontal(|ui| {
-                            ui.allocate_ui(egui::vec2(70.0, 20.0), |ui| {
-                                ui.label("Preset:");
+                    // ---- Middle 2 Columns: Strategy & Endpoints ----
+                    ui.columns(2, |cols| {
+                        Self::card_frame().show(&mut cols[0], |ui| {
+                            ui.label(egui::RichText::new("SCAN & GENERATION ENGINE").size(10.5).color(INDIGO).strong());
+                            ui.add_space(4.0);
+                            egui::Grid::new("scan_grid").num_columns(2).spacing([10.0, 4.0]).show(ui, |ui| {
+                                ui.label("Target working ciphers (0 = no limit):");
+                                ui.add(egui::DragValue::new(&mut self.target_found).range(0..=500));
+                                ui.end_row();
+
+                                ui.label("Max attempts:");
+                                ui.add(egui::DragValue::new(&mut self.max_attempts).range(1..=1000));
+                                ui.end_row();
+
+                                ui.label("HTTP timeout (sec):");
+                                ui.add(egui::DragValue::new(&mut self.timeout_secs).range(3..=60));
+                                ui.end_row();
                             });
-                            let prev = self.preset;
-                            egui::ComboBox::from_id_salt("preset_cb")
+
+                            ui.add_space(4.0);
+                            egui::ComboBox::from_id_salt("strategy_cb")
                                 .width(ui.available_width())
-                                .selected_text(self.preset.label())
+                                .selected_text(self.strategy.label())
                                 .show_ui(ui, |ui| {
-                                    ui.selectable_value(&mut self.preset, EndpointPreset::WorkerSafe, EndpointPreset::WorkerSafe.label());
-                                    ui.selectable_value(&mut self.preset, EndpointPreset::CloudflareDirect, EndpointPreset::CloudflareDirect.label());
-                                    ui.selectable_value(&mut self.preset, EndpointPreset::Custom, EndpointPreset::Custom.label());
+                                    for s in Strategy::ALL {
+                                        ui.selectable_value(&mut self.strategy, s, s.label());
+                                    }
                                 });
-                            if self.preset != prev {
-                                match self.preset {
-                                    EndpointPreset::WorkerSafe => {
-                                        self.ping_url = "https://www.gstatic.com/generate_204".into();
-                                        self.dl_url = "https://ajax.googleapis.com/ajax/libs/jquery/3.7.1/jquery.min.js".into();
-                                        self.ul_url = "https://postman-echo.com/post".into();
-                                    }
-                                    EndpointPreset::CloudflareDirect => {
-                                        self.ping_url = "https://cp.cloudflare.com/generate_204".into();
-                                        self.dl_url = "https://speed.cloudflare.com/__down?bytes=100000".into();
-                                        self.ul_url = "https://speed.cloudflare.com/__up".into();
-                                    }
-                                    EndpointPreset::Custom => {}
-                                }
-                            }
+
+                            ui.add_space(2.0);
+                            ui.checkbox(&mut self.run_ref, "Run [REF] F&F baseline benchmark first");
                         });
 
-                        ui.add_space(4.0);
-                        for (lbl, val) in [
-                            ("Ping (204):", &mut self.ping_url),
-                            ("Download:", &mut self.dl_url),
-                            ("Upload:", &mut self.ul_url),
-                        ] {
+                        Self::card_frame().show(&mut cols[1], |ui| {
+                            ui.label(egui::RichText::new("TEST ENDPOINTS  (Worker-Safe vs Direct/VPS)").size(10.5).color(PURPLE).strong());
+                            ui.add_space(4.0);
+
                             ui.horizontal(|ui| {
-                                ui.allocate_ui(egui::vec2(70.0, 20.0), |ui| {
-                                    ui.label(lbl);
+                                ui.allocate_ui(egui::vec2(66.0, 18.0), |ui| {
+                                    ui.label("Preset:");
                                 });
-                                if ui.add(
-                                    egui::TextEdit::singleline(val)
-                                        .desired_width(ui.available_width())
-                                        .font(egui::TextStyle::Monospace),
-                                ).changed() {
-                                    self.preset = EndpointPreset::Custom;
+                                let prev = self.preset;
+                                egui::ComboBox::from_id_salt("preset_cb")
+                                    .width(ui.available_width())
+                                    .selected_text(self.preset.label())
+                                    .show_ui(ui, |ui| {
+                                        ui.selectable_value(&mut self.preset, EndpointPreset::WorkerSafe, EndpointPreset::WorkerSafe.label());
+                                        ui.selectable_value(&mut self.preset, EndpointPreset::CloudflareDirect, EndpointPreset::CloudflareDirect.label());
+                                        ui.selectable_value(&mut self.preset, EndpointPreset::Custom, EndpointPreset::Custom.label());
+                                    });
+                                if self.preset != prev {
+                                    match self.preset {
+                                        EndpointPreset::WorkerSafe => {
+                                            self.ping_url = "https://www.gstatic.com/generate_204".into();
+                                            self.dl_url = "https://ajax.googleapis.com/ajax/libs/jquery/3.7.1/jquery.min.js".into();
+                                            self.ul_url = "https://postman-echo.com/post".into();
+                                        }
+                                        EndpointPreset::CloudflareDirect => {
+                                            self.ping_url = "https://cp.cloudflare.com/generate_204".into();
+                                            self.dl_url = "https://speed.cloudflare.com/__down?bytes=100000".into();
+                                            self.ul_url = "https://speed.cloudflare.com/__up".into();
+                                        }
+                                        EndpointPreset::Custom => {}
+                                    }
                                 }
                             });
-                            ui.add_space(3.0);
-                        }
-                    });
-                });
 
-                ui.add_space(8.0);
-
-                // ---- Final Mask Card ----
-                Self::card_frame().show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new("FINAL MASK (finalmask JSON)").size(11.0).color(AMBER).strong());
-                        ui.checkbox(&mut self.override_fm, "Apply / Override finalmask");
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.button("Validate").clicked() {
-                                match serde_json::from_str::<Value>(self.fm_input.trim()) {
-                                    Ok(v) => {
-                                        self.fm_input = v.to_string();
-                                        self.push_log("Final Mask JSON is valid.", LogLevel::Info);
+                            ui.add_space(2.0);
+                            for (lbl, val) in [
+                                ("Ping (204):", &mut self.ping_url),
+                                ("Download:", &mut self.dl_url),
+                                ("Upload:", &mut self.ul_url),
+                            ] {
+                                ui.horizontal(|ui| {
+                                    ui.allocate_ui(egui::vec2(66.0, 18.0), |ui| {
+                                        ui.label(lbl);
+                                    });
+                                    if ui.add(
+                                        egui::TextEdit::singleline(val)
+                                            .desired_width(ui.available_width())
+                                            .font(egui::TextStyle::Monospace),
+                                    ).changed() {
+                                        self.preset = EndpointPreset::Custom;
                                     }
-                                    Err(e) => self.push_log(format!("Final Mask JSON error: {e}"), LogLevel::Fail),
-                                }
-                            }
-                            if ui.button("F&F Default").clicked() {
-                                self.fm_input = DEFAULT_FINALMASK_STR.into();
+                                });
+                                ui.add_space(2.0);
                             }
                         });
                     });
-                    ui.add_space(4.0);
-                    egui::ScrollArea::vertical()
-                        .id_salt("fm_scroll")
-                        .max_height(52.0)
-                        .show(ui, |ui| {
+
+                    ui.add_space(5.0);
+
+                    // ---- Final Mask Card ----
+                    Self::card_frame().show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new("FINAL MASK (finalmask JSON)").size(10.5).color(AMBER).strong());
+                            ui.checkbox(&mut self.override_fm, "Apply / Override finalmask");
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.button("Validate").clicked() {
+                                    match serde_json::from_str::<Value>(self.fm_input.trim()) {
+                                        Ok(v) => {
+                                            self.fm_input = v.to_string();
+                                            self.push_log("Final Mask JSON is valid.", LogLevel::Info);
+                                        }
+                                        Err(e) => self.push_log(format!("Final Mask JSON error: {e}"), LogLevel::Fail),
+                                    }
+                                }
+                                if ui.button("F&F Default").clicked() {
+                                    self.fm_input = DEFAULT_FINALMASK_STR.into();
+                                }
+                                if ui.button(if self.expand_fm { "Compact" } else { "Expand" }).clicked() {
+                                    self.expand_fm = !self.expand_fm;
+                                }
+                            });
+                        });
+                        ui.add_space(3.0);
+                        if self.expand_fm {
+                            egui::ScrollArea::vertical()
+                                .id_salt("fm_scroll")
+                                .max_height(64.0)
+                                .show(ui, |ui| {
+                                    ui.add(
+                                        egui::TextEdit::multiline(&mut self.fm_input)
+                                            .desired_rows(3)
+                                            .desired_width(f32::INFINITY)
+                                            .font(egui::TextStyle::Monospace),
+                                    );
+                                });
+                        } else {
                             ui.add(
-                                egui::TextEdit::multiline(&mut self.fm_input)
-                                    .desired_rows(2)
+                                egui::TextEdit::singleline(&mut self.fm_input)
                                     .desired_width(f32::INFINITY)
                                     .font(egui::TextStyle::Monospace),
                             );
-                        });
-                });
+                        }
+                    });
 
-                ui.add_space(8.0);
+                    ui.add_space(6.0);
+                }
 
                 // ---- Action Bar + Progress ----
                 ui.horizontal(|ui| {
@@ -2044,6 +2291,12 @@ impl eframe::App for CipherStudioApp {
                         if ui.button("Clear Log").clicked() {
                             self.logs.clear();
                         }
+                        if ui
+                            .button(if self.hide_settings { "Show Settings" } else { "Hide Settings" })
+                            .clicked()
+                        {
+                            self.hide_settings = !self.hide_settings;
+                        }
                         if ui.selectable_label(self.active_tab == ActiveTab::Results, format!("Working Results ({})", self.results.len())).clicked() {
                             self.active_tab = ActiveTab::Results;
                         }
@@ -2053,9 +2306,9 @@ impl eframe::App for CipherStudioApp {
                     });
                 });
 
-                ui.add_space(6.0);
+                ui.add_space(5.0);
                 let bar_w = ui.available_width();
-                let (bar_rect, _) = ui.allocate_exact_size(egui::vec2(bar_w, 8.0), egui::Sense::hover());
+                let (bar_rect, _) = ui.allocate_exact_size(egui::vec2(bar_w, 7.0), egui::Sense::hover());
                 ui.painter().rect_filled(bar_rect, egui::CornerRadius::same(4), BG_CARD2);
                 let pct = self.progress_pct.clamp(0.0, 1.0);
                 if pct > 0.0 {
@@ -2063,7 +2316,7 @@ impl eframe::App for CipherStudioApp {
                     fill_rect.set_width((bar_rect.width() * pct).max(8.0));
                     ui.painter().rect_filled(fill_rect, egui::CornerRadius::same(4), EMERALD);
                 }
-                ui.add_space(6.0);
+                ui.add_space(5.0);
 
                 // ---- Output Area (Console / Results) ----
                 egui::Frame {
@@ -2075,11 +2328,12 @@ impl eframe::App for CipherStudioApp {
                 }
                 .show(ui, |ui| {
                     let avail = ui.available_size();
-                    ui.set_min_size(avail);
+                    ui.set_min_size(egui::vec2(avail.x, avail.y.max(200.0)));
 
                     match self.active_tab {
                         ActiveTab::Console => {
                             egui::ScrollArea::vertical()
+                                .id_salt("console_scroll")
                                 .stick_to_bottom(true)
                                 .auto_shrink([false, false])
                                 .show(ui, |ui| {
@@ -2115,6 +2369,7 @@ impl eframe::App for CipherStudioApp {
                             let mut copy_cfg_msg: Option<(String, String)> = None;
 
                             egui::ScrollArea::vertical()
+                                .id_salt("results_scroll")
                                 .auto_shrink([false, false])
                                 .show(ui, |ui| {
                                     if sorted.is_empty() {
@@ -2173,7 +2428,7 @@ impl eframe::App for CipherStudioApp {
 
 fn main() -> eframe::Result<()> {
     let mut viewport = egui::ViewportBuilder::default()
-        .with_inner_size([1040.0, 760.0])
+        .with_inner_size([1060.0, 800.0])
         .with_min_inner_size([880.0, 640.0]);
 
     if let Ok(icon) = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png")) {
