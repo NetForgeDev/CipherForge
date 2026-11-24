@@ -41,7 +41,7 @@
 
 ## راهنمای سریع اجرا (نسخه پرتابل ویندوز)
 
-1. آخرین نسخه را از بخش [**Releases**](https://github.com/<YOUR_USERNAME>/CipherForge/releases) دانلود و از حالت فشرده خارج کنید.
+1. آخرین نسخه را از بخش [**Releases**](https://github.com/NetForgeDev/CipherForge/releases) دانلود و از حالت فشرده خارج کنید.
 2. مطمئن شوید فایل **`xray.exe`** (از مخزن [`patterniha/Xray-core`](https://github.com/patterniha/Xray-core/releases) که از آرایه‌های `lengths`/`delays` در `finalmask` پشتیبانی می‌کند) در **کنار `CipherForge.exe`** قرار دارد (یا با دکمه `Pick xray.exe` داخل برنامه مسیرش را بدهید).
 3. برنامه **`CipherForge.exe`** را اجرا کنید *(قبل از اسکن، VPN سیستم را خاموش کنید)*.
 4. لینک سرور را Paste کرده، پروفیل تست را انتخاب کنید و **Start Search** را بزنید.
