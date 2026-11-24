@@ -1,4 +1,4 @@
-name: Build Portable Windows EXE
+name: Build Portable Windows Release
 
 on:
   push:
@@ -11,9 +11,40 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - run: cargo build --release
-      - uses: softprops/action-gh-release@v2
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build CipherForge release binary
+        run: cargo build --release
+
+      - name: Download patterniha/Xray-core & Package Portable ZIP
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $bundleDir = "release_bundle"
+          New-Item -ItemType Directory -Force -Path $bundleDir | Out-Null
+
+          Copy-Item "target\release\CipherForge.exe" "$bundleDir\CipherForge.exe"
+
+          Invoke-WebRequest -Uri "https://github.com/patterniha/Xray-core/releases/latest/download/Xray-windows-64.zip" -OutFile "xray.zip"
+          Expand-Archive -Path "xray.zip" -DestinationPath "xray_extracted" -Force
+
+          $xrayExe = Get-ChildItem -Path "xray_extracted" -Filter "xray.exe" -Recurse | Select-Object -First 1
+          if (-not $xrayExe) { throw "xray.exe was not found inside Xray-windows-64.zip!" }
+          Copy-Item $xrayExe.FullName "$bundleDir\xray.exe"
+
+          if (Test-Path "README.md") { Copy-Item "README.md" "$bundleDir\README.md" }
+          if (Test-Path "README.fa.md") { Copy-Item "README.fa.md" "$bundleDir\README.fa.md" }
+
+          $zipName = "CipherForge-$tag-windows-x64.zip"
+          Compress-Archive -Path "$bundleDir\*" -DestinationPath $zipName -Force
+          echo "ZIP_NAME=$zipName" >> $env:GITHUB_ENV
+
+      - name: Publish Release ZIP
+        uses: softprops/action-gh-release@v2
         with:
-          files: target/release/CipherForge.exe
+          files: ${{ env.ZIP_NAME }}
+          generate_release_notes: true
