@@ -1944,37 +1944,6 @@ impl eframe::App for CipherStudioApp {
                             self.show_about = true;
                         }
 
-                        let upd_btn_txt = match &self.update_state {
-                            UpdateState::Checking => "Checking...",
-                            UpdateState::Available { tag, .. } => {
-                                // Show badge text
-                                let _ = tag;
-                                "Update Found!"
-                            }
-                            _ => "Updates",
-                        };
-                        let upd_fill = if matches!(self.update_state, UpdateState::Available { .. }) {
-                            AMBER
-                        } else {
-                            BG_CARD2
-                        };
-                        let upd_fg = if matches!(self.update_state, UpdateState::Available { .. }) {
-                            BG_MAIN
-                        } else {
-                            FG_TEXT
-                        };
-                        if ui
-                            .add(egui::Button::new(egui::RichText::new(upd_btn_txt).color(upd_fg)).fill(upd_fill))
-                            .clicked()
-                        {
-                            if let UpdateState::Available { url, .. } = &self.update_state {
-                                ui.ctx().open_url(egui::OpenUrl::new_tab(url));
-                            } else {
-                                self.show_about = true;
-                                self.trigger_update_check();
-                            }
-                        }
-
                         if ui.button("GitHub").clicked() {
                             ui.ctx().open_url(egui::OpenUrl::new_tab(GITHUB_REPO_URL));
                         }
