@@ -47,7 +47,7 @@ Unlike simple ping checkers, CipherForge routes real **HTTP Latency**, **Downloa
 
 ## Quick Start (Portable Windows Release)
 
-1. Download the latest release ZIP from the [**Releases**](https://github.com/<YOUR_USERNAME>/CipherForge/releases) page and extract it.
+1. Download the latest release ZIP from the [**Releases**](https://github.com/NetForgeDev/CipherForge/releases) page and extract it.
 2. Make sure **`xray.exe`** (from [`patterniha/Xray-core`](https://github.com/patterniha/Xray-core/releases), which supports multi-array `finalmask` `lengths`/`delays`) is in the **same folder** as `CipherForge.exe` (or select it using the `Pick xray.exe` button inside the app).
 3. Run **`CipherForge.exe`**. *(Make sure any system VPN is turned off while scanning.)*
 4. Paste your `vless://`, `trojan://`, or `vmess://` link, choose your endpoint preset (`Worker-Safe` for Cloudflare Workers), and click **Start Search**.
@@ -64,7 +64,7 @@ Results are also automatically saved to `working_ciphers.txt`.
 - Windows: Visual Studio Build Tools (*Desktop development with C++*)
 
 ```bash
-git clone https://github.com/<YOUR_USERNAME>/CipherForge.git
+git clone https://github.com/NetForgeDev/CipherForge.git
 cd CipherForge
 cargo build --release
 ```
