@@ -7,7 +7,8 @@ use rand::seq::{IndexedRandom, SliceRandom};
 use rand::{Rng, RngCore};
 use serde_json::{Value, json};
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
@@ -19,8 +20,11 @@ use url::Url;
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 const GITHUB_REPO_URL: &str = "https://github.com/NetForgeDev/CipherForge";
 const GITHUB_RELEASES_URL: &str = "https://github.com/NetForgeDev/CipherForge/releases/latest";
-const GITHUB_API_LATEST: &str = "https://api.github.com/repos/NetForgeDev/CipherForge/releases/latest";
+const GITHUB_API_LATEST: &str =
+    "https://api.github.com/repos/NetForgeDev/CipherForge/releases/latest";
 const XRAY_FORK_URL: &str = "https://github.com/patterniha/Xray-core/releases";
+const XRAY_API_LATEST: &str =
+    "https://api.github.com/repos/patterniha/Xray-core/releases/latest";
 
 const DEFAULT_FINALMASK_STR: &str = r#"{"tcp":[{"type":"fragment","settings":{"packets":"tlshello","lengths":["0","104","1"],"delays":["0"],"maxSplit":"0"}},{"type":"fragment","settings":{"packets":"1-1","lengths":["114","1"],"delays":["1"],"maxSplit":"11"}}]}"#;
 
@@ -49,6 +53,7 @@ const ROSE_HI: egui::Color32 = egui::Color32::from_rgb(251, 113, 133);
 const ROSE_SOFT: egui::Color32 = egui::Color32::from_rgb(58, 22, 34);
 const SKY: egui::Color32 = egui::Color32::from_rgb(56, 189, 248);
 const AMBER: egui::Color32 = egui::Color32::from_rgb(251, 191, 36);
+const AMBER_SOFT: egui::Color32 = egui::Color32::from_rgb(56, 42, 16);
 const PURPLE: egui::Color32 = egui::Color32::from_rgb(192, 132, 252);
 const PURPLE_SOFT: egui::Color32 = egui::Color32::from_rgb(46, 28, 72);
 
@@ -152,12 +157,46 @@ enum WorkerMsg {
     Finished { stopped: bool },
 }
 
-enum UpdateState {
+#[derive(Clone)]
+struct ReleaseInfo {
+    tag: String,
+    html_url: String,
+    asset_name: Option<String>,
+    download_url: Option<String>,
+}
+
+enum AppUpdateState {
     Idle,
     Checking,
     UpToDate(String),
-    Available { tag: String, url: String },
+    Available(ReleaseInfo),
+    Updating { stage: String, progress: f32 },
     Error(String),
+}
+
+enum AppUpdateMsg {
+    CheckResult(Result<ReleaseInfo, String>),
+    Progress { stage: String, progress: f32 },
+    ReadyToRestart(PathBuf),
+    Failed(String),
+}
+
+enum XrayUpdateState {
+    Idle,
+    Checking,
+    UpToDate(String),
+    Available(ReleaseInfo),
+    Installing { stage: String, progress: f32 },
+    Installed(String),
+    Error(String),
+}
+
+enum XrayMsg {
+    VersionDetected(Option<String>),
+    CheckResult(Result<ReleaseInfo, String>),
+    Progress { stage: String, progress: f32 },
+    InstallDone { path: PathBuf, tag: String },
+    InstallFailed(String),
 }
 
 #[derive(Clone)]
@@ -176,6 +215,13 @@ struct ScanParams {
     ping_url: String,
     dl_url: String,
     ul_url: String,
+}
+
+struct TempGuard(PathBuf);
+impl Drop for TempGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
 }
 
 // ================= Clipboard & Input Helpers =================
@@ -348,9 +394,48 @@ impl NumInput {
     }
 }
 
-// ================= Path Discovery & Update Check =================
+// ================= Path Discovery, Version Comparison & Updaters =================
+fn xray_bin_name() -> &'static str {
+    if cfg!(windows) { "xray.exe" } else { "xray" }
+}
+
+fn xray_expected_asset_name() -> &'static str {
+    if cfg!(target_os = "windows") {
+        if cfg!(target_arch = "aarch64") {
+            "Xray-windows-arm64-v8a.zip"
+        } else {
+            "Xray-windows-64.zip"
+        }
+    } else if cfg!(target_os = "macos") {
+        if cfg!(target_arch = "aarch64") {
+            "Xray-macos-arm64-v8a.zip"
+        } else {
+            "Xray-macos-64.zip"
+        }
+    } else if cfg!(target_arch = "aarch64") {
+        "Xray-linux-arm64-v8a.zip"
+    } else {
+        "Xray-linux-64.zip"
+    }
+}
+
+fn cleanup_old_self_update_binary() {
+    if let Ok(exe) = std::env::current_exe() {
+        let old = old_exe_path(&exe);
+        if old.exists() {
+            let _ = std::fs::remove_file(&old);
+        }
+    }
+}
+
+fn old_exe_path(exe: &Path) -> PathBuf {
+    let mut os = exe.as_os_str().to_os_string();
+    os.push(".old");
+    PathBuf::from(os)
+}
+
 fn resolve_base_dir() -> PathBuf {
-    let bin_name = if cfg!(windows) { "xray.exe" } else { "xray" };
+    let bin_name = xray_bin_name();
     if let Ok(exe) = std::env::current_exe()
         && let Some(dir) = exe.parent()
         && dir.join(bin_name).exists()
@@ -368,59 +453,586 @@ fn resolve_base_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
-fn parse_semver(s: &str) -> (u64, u64, u64) {
+fn parse_version_parts(s: &str) -> Vec<u64> {
     let clean = s.trim().trim_start_matches(['v', 'V']);
-    let mut parts = clean.split('.').map(|p| {
-        p.chars()
-            .take_while(|c| c.is_ascii_digit())
-            .collect::<String>()
-            .parse::<u64>()
-            .unwrap_or(0)
-    });
-    (
-        parts.next().unwrap_or(0),
-        parts.next().unwrap_or(0),
-        parts.next().unwrap_or(0),
-    )
+    let mut parts = Vec::new();
+    for seg in clean.split(['.', '-', '_']) {
+        let digits: String = seg.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if digits.is_empty() {
+            if !parts.is_empty() {
+                break;
+            }
+            continue;
+        }
+        if let Ok(n) = digits.parse::<u64>() {
+            parts.push(n);
+        }
+    }
+    parts
 }
 
-fn spawn_update_check(tx: Sender<Result<(String, String), String>>) {
+fn is_newer_version(latest: &str, current: &str) -> bool {
+    let a = parse_version_parts(latest);
+    let b = parse_version_parts(current);
+    if a.is_empty() {
+        return false;
+    }
+    if b.is_empty() {
+        return true;
+    }
+    let len = a.len().max(b.len());
+    for i in 0..len {
+        let va = *a.get(i).unwrap_or(&0);
+        let vb = *b.get(i).unwrap_or(&0);
+        if va != vb {
+            return va > vb;
+        }
+    }
+    false
+}
+
+fn format_version_tag(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.starts_with('v') || trimmed.starts_with('V') {
+        format!("v{}", &trimmed[1..])
+    } else {
+        format!("v{trimmed}")
+    }
+}
+
+fn format_mb(bytes: u64) -> String {
+    format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+}
+
+fn spawn_detect_xray_version(path: PathBuf, tx: Sender<XrayMsg>) {
+    std::thread::spawn(move || {
+        if !path.exists() {
+            let _ = tx.send(XrayMsg::VersionDetected(None));
+            return;
+        }
+
+        let mut cmd = std::process::Command::new(&path);
+        cmd.arg("version")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+
+        let parsed = cmd.output().ok().and_then(|out| {
+            let combined = format!(
+                "{}\n{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            for line in combined.lines() {
+                let l = line.trim();
+                if l.to_lowercase().starts_with("xray ") {
+                    let token = l.split_whitespace().nth(1)?;
+                    if !parse_version_parts(token).is_empty() {
+                        return Some(format_version_tag(token));
+                    }
+                }
+            }
+            None
+        });
+
+        let _ = tx.send(XrayMsg::VersionDetected(parsed));
+    });
+}
+
+async fn fetch_github_release(
+    api_url: &str,
+    fallback_html: &str,
+    preferred_asset: Option<&str>,
+) -> Result<ReleaseInfo, String> {
+    let client = reqwest::Client::builder()
+        .user_agent(format!("CipherForge/{APP_VERSION}"))
+        .timeout(Duration::from_secs(15))
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let resp = client
+        .get(api_url)
+        .send()
+        .await
+        .map_err(|e| format!("Network error: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("GitHub API HTTP {}", resp.status()));
+    }
+    let body = resp.bytes().await.map_err(|e| e.to_string())?;
+    let data: Value = serde_json::from_slice(&body).map_err(|e| e.to_string())?;
+
+    let tag = data
+        .get("tag_name")
+        .and_then(|v| v.as_str())
+        .ok_or("No tag_name in release response")?
+        .to_string();
+    let html_url = data
+        .get("html_url")
+        .and_then(|v| v.as_str())
+        .unwrap_or(fallback_html)
+        .to_string();
+
+    let mut asset_name: Option<String> = None;
+    let mut download_url: Option<String> = None;
+
+    if let Some(assets) = data.get("assets").and_then(|v| v.as_array()) {
+        // 1. Exact preferred asset match (case-insensitive)
+        if let Some(pref) = preferred_asset {
+            for a in assets {
+                if let (Some(name), Some(url)) = (
+                    a.get("name").and_then(|v| v.as_str()),
+                    a.get("browser_download_url").and_then(|v| v.as_str()),
+                ) && name.eq_ignore_ascii_case(pref)
+                {
+                    asset_name = Some(name.to_string());
+                    download_url = Some(url.to_string());
+                    break;
+                }
+            }
+        }
+        // 2. Platform-aware ZIP fallback
+        if download_url.is_none() {
+            let os_hint = if cfg!(target_os = "windows") {
+                "windows"
+            } else if cfg!(target_os = "macos") {
+                "macos"
+            } else {
+                "linux"
+            };
+            for a in assets {
+                if let (Some(name), Some(url)) = (
+                    a.get("name").and_then(|v| v.as_str()),
+                    a.get("browser_download_url").and_then(|v| v.as_str()),
+                ) {
+                    let lower = name.to_lowercase();
+                    if lower.ends_with(".zip") && lower.contains(os_hint) {
+                        asset_name = Some(name.to_string());
+                        download_url = Some(url.to_string());
+                        break;
+                    }
+                }
+            }
+        }
+        // 3. Any .zip fallback
+        if download_url.is_none() {
+            for a in assets {
+                if let (Some(name), Some(url)) = (
+                    a.get("name").and_then(|v| v.as_str()),
+                    a.get("browser_download_url").and_then(|v| v.as_str()),
+                ) && name.to_lowercase().ends_with(".zip")
+                {
+                    asset_name = Some(name.to_string());
+                    download_url = Some(url.to_string());
+                    break;
+                }
+            }
+        }
+    }
+
+    Ok(ReleaseInfo {
+        tag,
+        html_url,
+        asset_name,
+        download_url,
+    })
+}
+
+async fn download_file_with_progress(
+    url: &str,
+    dest: &Path,
+    mut on_progress: impl FnMut(u64, Option<u64>),
+) -> Result<(), String> {
+    let client = reqwest::Client::builder()
+        .user_agent(format!("CipherForge/{APP_VERSION}"))
+        .connect_timeout(Duration::from_secs(20))
+        .timeout(Duration::from_secs(300))
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let mut resp = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| format!("Download failed: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("Download HTTP {}", resp.status()));
+    }
+
+    let total = resp.content_length();
+    let mut file =
+        std::fs::File::create(dest).map_err(|e| format!("Cannot create temp archive: {e}"))?;
+    let mut downloaded: u64 = 0;
+    let mut last_report = Instant::now();
+
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|e| format!("Download stream interrupted: {e}"))?
+    {
+        file.write_all(&chunk)
+            .map_err(|e| format!("Failed writing archive: {e}"))?;
+        downloaded += chunk.len() as u64;
+        if last_report.elapsed() >= Duration::from_millis(70) {
+            on_progress(downloaded, total);
+            last_report = Instant::now();
+        }
+    }
+    file.flush().map_err(|e| e.to_string())?;
+    on_progress(downloaded, total);
+    Ok(())
+}
+
+/// Extracts ONLY the single target binary (ignoring .dat, docs, and all other files)
+/// from `zip_path` into `dest_file`.
+fn extract_single_binary_from_zip(
+    zip_path: &Path,
+    target_names: &[&str],
+    dest_file: &Path,
+) -> Result<(), String> {
+    let file =
+        std::fs::File::open(zip_path).map_err(|e| format!("Failed opening ZIP archive: {e}"))?;
+    let mut archive =
+        zip::ZipArchive::new(file).map_err(|e| format!("Invalid ZIP archive: {e}"))?;
+
+    for i in 0..archive.len() {
+        let mut entry = archive
+            .by_index(i)
+            .map_err(|e| format!("ZIP entry error: {e}"))?;
+        if entry.is_dir() {
+            continue;
+        }
+        let Some(fname) = Path::new(entry.name())
+            .file_name()
+            .and_then(|n| n.to_str())
+        else {
+            continue;
+        };
+
+        if target_names.iter().any(|t| fname.eq_ignore_ascii_case(t)) {
+            let mut out = std::fs::File::create(dest_file)
+                .map_err(|e| format!("Cannot create extracted binary: {e}"))?;
+            std::io::copy(&mut entry, &mut out)
+                .map_err(|e| format!("Extraction write failed: {e}"))?;
+            out.flush().map_err(|e| e.to_string())?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(dest_file, std::fs::Permissions::from_mode(0o755));
+            }
+            return Ok(());
+        }
+    }
+
+    Err(format!(
+        "Target binary ({}) was not found inside the ZIP archive.",
+        target_names.join(" / ")
+    ))
+}
+
+fn spawn_app_update_check(tx: Sender<AppUpdateMsg>) {
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build();
         let res = match rt {
-            Ok(rt) => rt.block_on(async {
-                let client = reqwest::Client::builder()
-                    .user_agent(format!("CipherForge/{APP_VERSION}"))
-                    .timeout(Duration::from_secs(10))
-                    .build()
-                    .map_err(|e| e.to_string())?;
-                let resp = client
-                    .get(GITHUB_API_LATEST)
-                    .send()
-                    .await
-                    .map_err(|e| format!("Network error: {e}"))?;
-                if !resp.status().is_success() {
-                    return Err(format!("GitHub API HTTP {}", resp.status()));
-                }
-                let body = resp.bytes().await.map_err(|e| e.to_string())?;
-                let data: Value = serde_json::from_slice(&body).map_err(|e| e.to_string())?;
-                let tag = data
-                    .get("tag_name")
-                    .and_then(|v| v.as_str())
-                    .ok_or("No tag_name in release response")?
-                    .to_string();
-                let url = data
-                    .get("html_url")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or(GITHUB_RELEASES_URL)
-                    .to_string();
-                Ok((tag, url))
-            }),
+            Ok(rt) => rt.block_on(fetch_github_release(
+                GITHUB_API_LATEST,
+                GITHUB_RELEASES_URL,
+                None,
+            )),
             Err(e) => Err(e.to_string()),
         };
-        let _ = tx.send(res);
+        let _ = tx.send(AppUpdateMsg::CheckResult(res));
+    });
+}
+
+fn spawn_app_self_update(download_url: String, tx: Sender<AppUpdateMsg>) {
+    std::thread::spawn(move || {
+        let rt = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(rt) => rt,
+            Err(e) => {
+                let _ = tx.send(AppUpdateMsg::Failed(e.to_string()));
+                return;
+            }
+        };
+
+        let result: Result<PathBuf, String> = rt.block_on(async {
+            let current_exe =
+                std::env::current_exe().map_err(|e| format!("Cannot resolve current exe: {e}"))?;
+            let exe_dir = current_exe
+                .parent()
+                .ok_or("Cannot determine application directory")?;
+            let current_name = current_exe
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(if cfg!(windows) {
+                    "CipherForge.exe"
+                } else {
+                    "CipherForge"
+                })
+                .to_string();
+
+            let zip_path = std::env::temp_dir().join(format!(
+                "cipherforge_app_update_{}_{}.zip",
+                std::process::id(),
+                rand::rng().random_range(1000..9999)
+            ));
+            let _zip_guard = TempGuard(zip_path.clone());
+
+            let _ = tx.send(AppUpdateMsg::Progress {
+                stage: "Connecting to GitHub...".into(),
+                progress: 0.05,
+            });
+
+            download_file_with_progress(&download_url, &zip_path, |dl, total| {
+                let (pct, label) = if let Some(tot) = total
+                    && tot > 0
+                {
+                    let frac = (dl as f32 / tot as f32).clamp(0.0, 1.0);
+                    (
+                        0.05 + frac * 0.75,
+                        format!("Downloading update... {} / {}", format_mb(dl), format_mb(tot)),
+                    )
+                } else {
+                    (0.4, format!("Downloading update... {}", format_mb(dl)))
+                };
+                let _ = tx.send(AppUpdateMsg::Progress {
+                    stage: label,
+                    progress: pct,
+                });
+            })
+            .await?;
+
+            let _ = tx.send(AppUpdateMsg::Progress {
+                stage: "Extracting CipherForge executable...".into(),
+                progress: 0.85,
+            });
+
+            let staged_exe = exe_dir.join(format!("{current_name}.new"));
+            let _staged_guard = TempGuard(staged_exe.clone());
+
+            let default_name = if cfg!(windows) {
+                "CipherForge.exe"
+            } else {
+                "CipherForge"
+            };
+            {
+                // Scoped so the ZIP file handle closes cleanly before TempGuard removes it
+                extract_single_binary_from_zip(
+                    &zip_path,
+                    &[current_name.as_str(), default_name],
+                    &staged_exe,
+                )?;
+            }
+
+            let _ = tx.send(AppUpdateMsg::Progress {
+                stage: "Installing update & cleaning up...".into(),
+                progress: 0.95,
+            });
+
+            let old_exe = old_exe_path(&current_exe);
+            if old_exe.exists() {
+                let _ = std::fs::remove_file(&old_exe);
+            }
+
+            std::fs::rename(&current_exe, &old_exe).map_err(|e| {
+                format!("Cannot replace running executable (check folder permissions): {e}")
+            })?;
+
+            if let Err(e) = std::fs::rename(&staged_exe, &current_exe) {
+                // Roll back cleanly so the app is never left broken
+                let _ = std::fs::rename(&old_exe, &current_exe);
+                return Err(format!("Failed moving updated binary into place: {e}"));
+            }
+
+            // Explicit drop cleans up the temporary ZIP right before restart
+            drop(_zip_guard);
+
+            Ok(current_exe)
+        });
+
+        match result {
+            Ok(exe_path) => {
+                let _ = tx.send(AppUpdateMsg::ReadyToRestart(exe_path));
+            }
+            Err(e) => {
+                let _ = tx.send(AppUpdateMsg::Failed(e));
+            }
+        }
+    });
+}
+
+fn spawn_xray_update_check(tx: Sender<XrayMsg>) {
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build();
+        let res = match rt {
+            Ok(rt) => rt.block_on(fetch_github_release(
+                XRAY_API_LATEST,
+                XRAY_FORK_URL,
+                Some(xray_expected_asset_name()),
+            )),
+            Err(e) => Err(e.to_string()),
+        };
+        let _ = tx.send(XrayMsg::CheckResult(res));
+    });
+}
+
+/// Downloads the Xray ZIP (either from an already-fetched ReleaseInfo or by fetching latest first),
+/// extracts ONLY `xray.exe` / `xray` (skipping `.dat` and other files), replaces cleanly,
+/// and deletes the ZIP archive automatically.
+fn spawn_xray_download_install(
+    release_opt: Option<ReleaseInfo>,
+    target_path: PathBuf,
+    tx: Sender<XrayMsg>,
+) {
+    std::thread::spawn(move || {
+        let rt = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(rt) => rt,
+            Err(e) => {
+                let _ = tx.send(XrayMsg::InstallFailed(e.to_string()));
+                return;
+            }
+        };
+
+        let result: Result<(PathBuf, String), String> = rt.block_on(async {
+            let release = match release_opt {
+                Some(r) => r,
+                None => {
+                    let _ = tx.send(XrayMsg::Progress {
+                        stage: "Fetching latest patterniha/Xray-core release...".into(),
+                        progress: 0.05,
+                    });
+                    fetch_github_release(
+                        XRAY_API_LATEST,
+                        XRAY_FORK_URL,
+                        Some(xray_expected_asset_name()),
+                    )
+                    .await?
+                }
+            };
+
+            let dl_url = release
+                .download_url
+                .ok_or("No compatible ZIP asset found in latest Xray release.")?;
+
+            if let Some(parent) = target_path.parent()
+                && !parent.exists()
+            {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| format!("Cannot create target directory: {e}"))?;
+            }
+
+            let zip_path = std::env::temp_dir().join(format!(
+                "cipherforge_xray_{}_{}.zip",
+                std::process::id(),
+                rand::rng().random_range(1000..9999)
+            ));
+            let _zip_guard = TempGuard(zip_path.clone());
+
+            let _ = tx.send(XrayMsg::Progress {
+                stage: format!("Downloading {}...", release.tag),
+                progress: 0.1,
+            });
+
+            let tag_for_cb = release.tag.clone();
+            download_file_with_progress(&dl_url, &zip_path, |dl, total| {
+                let (pct, label) = if let Some(tot) = total
+                    && tot > 0
+                {
+                    let frac = (dl as f32 / tot as f32).clamp(0.0, 1.0);
+                    (
+                        0.1 + frac * 0.72,
+                        format!(
+                            "Downloading Xray {}... {} / {}",
+                            tag_for_cb,
+                            format_mb(dl),
+                            format_mb(tot)
+                        ),
+                    )
+                } else {
+                    (
+                        0.45,
+                        format!("Downloading Xray {}... {}", tag_for_cb, format_mb(dl)),
+                    )
+                };
+                let _ = tx.send(XrayMsg::Progress {
+                    stage: label,
+                    progress: pct,
+                });
+            })
+            .await?;
+
+            let _ = tx.send(XrayMsg::Progress {
+                stage: format!("Extracting {} only...", xray_bin_name()),
+                progress: 0.86,
+            });
+
+            let staged_path = {
+                let mut os = target_path.as_os_str().to_os_string();
+                os.push(".new");
+                PathBuf::from(os)
+            };
+            let _staged_guard = TempGuard(staged_path.clone());
+
+            {
+                extract_single_binary_from_zip(&zip_path, &[xray_bin_name()], &staged_path)?;
+            }
+
+            let _ = tx.send(XrayMsg::Progress {
+                stage: "Replacing core binary & cleaning up ZIP...".into(),
+                progress: 0.95,
+            });
+
+            let backup_path = {
+                let mut os = target_path.as_os_str().to_os_string();
+                os.push(".bak");
+                PathBuf::from(os)
+            };
+            let had_existing = target_path.exists();
+            if had_existing {
+                if backup_path.exists() {
+                    let _ = std::fs::remove_file(&backup_path);
+                }
+                std::fs::rename(&target_path, &backup_path).map_err(|e| {
+                    format!("Cannot replace existing Xray binary (is it running?): {e}")
+                })?;
+            }
+
+            if let Err(e) = std::fs::rename(&staged_path, &target_path) {
+                if had_existing {
+                    let _ = std::fs::rename(&backup_path, &target_path);
+                }
+                return Err(format!("Failed installing new Xray binary: {e}"));
+            }
+            if had_existing {
+                let _ = std::fs::remove_file(&backup_path);
+            }
+
+            // _zip_guard drops here, automatically removing the temporary ZIP archive
+            Ok((target_path, format_version_tag(&release.tag)))
+        });
+
+        match result {
+            Ok((path, tag)) => {
+                let _ = tx.send(XrayMsg::InstallDone { path, tag });
+            }
+            Err(e) => {
+                let _ = tx.send(XrayMsg::InstallFailed(e));
+            }
+        }
     });
 }
 
@@ -1532,13 +2144,6 @@ async fn run_single_probe(
     let cfg_path = std::env::temp_dir().join(temp_name);
     let cfg_bytes = serde_json::to_vec_pretty(&cfg).map_err(|e| e.to_string())?;
     std::fs::write(&cfg_path, cfg_bytes).map_err(|e| e.to_string())?;
-
-    struct TempGuard(PathBuf);
-    impl Drop for TempGuard {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.0);
-        }
-    }
     let _guard = TempGuard(cfg_path.clone());
 
     let mut cmd = tokio::process::Command::new(&params.xray_path);
@@ -1836,6 +2441,13 @@ fn spawn_worker(params: ScanParams, tx: Sender<WorkerMsg>, mut stop_rx: watch::R
 struct CipherStudioApp {
     base_dir: PathBuf,
     xray_path: PathBuf,
+    xray_version: Option<String>,
+    xray_detecting: bool,
+    xray_state: XrayUpdateState,
+    xray_tx: Sender<XrayMsg>,
+    xray_rx: Receiver<XrayMsg>,
+    show_xray_modal: bool,
+
     proxy_input: String,
     expand_link: bool,
     expand_fm: bool,
@@ -1871,8 +2483,9 @@ struct CipherStudioApp {
     rx: Option<Receiver<WorkerMsg>>,
     stop_tx: Option<watch::Sender<bool>>,
 
-    update_state: UpdateState,
-    update_rx: Option<Receiver<Result<(String, String), String>>>,
+    app_update_state: AppUpdateState,
+    app_update_tx: Sender<AppUpdateMsg>,
+    app_update_rx: Receiver<AppUpdateMsg>,
 }
 
 impl CipherStudioApp {
@@ -1945,12 +2558,20 @@ impl CipherStudioApp {
         Self::configure_theme(&cc.egui_ctx);
 
         let base_dir = resolve_base_dir();
-        let bin_name = if cfg!(windows) { "xray.exe" } else { "xray" };
-        let xray_path = base_dir.join(bin_name);
+        let xray_path = base_dir.join(xray_bin_name());
+        let (xray_tx, xray_rx) = mpsc::channel();
+        let (app_update_tx, app_update_rx) = mpsc::channel();
 
         let mut app = Self {
             base_dir: base_dir.clone(),
             xray_path: xray_path.clone(),
+            xray_version: None,
+            xray_detecting: false,
+            xray_state: XrayUpdateState::Idle,
+            xray_tx,
+            xray_rx,
+            show_xray_modal: false,
+
             proxy_input: String::new(),
             expand_link: false,
             expand_fm: false,
@@ -1981,8 +2602,9 @@ impl CipherStudioApp {
             results: Vec::new(),
             rx: None,
             stop_tx: None,
-            update_state: UpdateState::Idle,
-            update_rx: None,
+            app_update_state: AppUpdateState::Idle,
+            app_update_tx,
+            app_update_rx,
         };
         app.push_log(
             format!("CipherForge v{APP_VERSION} ready. Xray: {}", xray_path.display()),
@@ -1992,6 +2614,7 @@ impl CipherStudioApp {
             "Paste a VLESS / Trojan / VMess link in the left panel and click 'Start Search'.",
             LogLevel::Info,
         );
+        app.trigger_xray_version_detect();
         app
     }
 
@@ -2017,17 +2640,77 @@ impl CipherStudioApp {
         self.parsed_summary = parse_proxy_input(&self.proxy_input).map(|(_, s)| s);
     }
 
-    fn trigger_update_check(&mut self) {
-        if matches!(self.update_state, UpdateState::Checking) {
+    fn trigger_xray_version_detect(&mut self) {
+        self.xray_version = None;
+        if !self.xray_path.exists() {
+            self.xray_detecting = false;
             return;
         }
-        self.update_state = UpdateState::Checking;
-        let (tx, rx) = mpsc::channel();
-        self.update_rx = Some(rx);
-        spawn_update_check(tx);
+        self.xray_detecting = true;
+        spawn_detect_xray_version(self.xray_path.clone(), self.xray_tx.clone());
     }
 
-    fn poll_worker(&mut self) {
+    fn trigger_xray_update_check(&mut self) {
+        if matches!(
+            self.xray_state,
+            XrayUpdateState::Checking | XrayUpdateState::Installing { .. }
+        ) {
+            return;
+        }
+        self.xray_state = XrayUpdateState::Checking;
+        spawn_xray_update_check(self.xray_tx.clone());
+    }
+
+    fn trigger_xray_install(&mut self, release: Option<ReleaseInfo>) {
+        if self.is_running
+            || matches!(
+                self.xray_state,
+                XrayUpdateState::Checking | XrayUpdateState::Installing { .. }
+            )
+        {
+            return;
+        }
+        let target_path = if self.xray_path.exists() {
+            self.xray_path.clone()
+        } else {
+            self.base_dir.join(xray_bin_name())
+        };
+        self.xray_state = XrayUpdateState::Installing {
+            stage: "Preparing Xray Core download...".into(),
+            progress: 0.02,
+        };
+        spawn_xray_download_install(release, target_path, self.xray_tx.clone());
+    }
+
+    fn trigger_app_update_check(&mut self) {
+        if matches!(
+            self.app_update_state,
+            AppUpdateState::Checking | AppUpdateState::Updating { .. }
+        ) {
+            return;
+        }
+        self.app_update_state = AppUpdateState::Checking;
+        spawn_app_update_check(self.app_update_tx.clone());
+    }
+
+    fn trigger_app_self_update(&mut self, download_url: String) {
+        if self.is_running
+            || matches!(
+                self.app_update_state,
+                AppUpdateState::Checking | AppUpdateState::Updating { .. }
+            )
+        {
+            return;
+        }
+        self.app_update_state = AppUpdateState::Updating {
+            stage: "Preparing update download...".into(),
+            progress: 0.02,
+        };
+        spawn_app_self_update(download_url, self.app_update_tx.clone());
+    }
+
+    fn poll_background_tasks(&mut self) {
+        // 1. Scan Worker
         let mut finished = false;
         let mut drained = Vec::new();
         if let Some(rx) = &self.rx {
@@ -2060,26 +2743,111 @@ impl CipherStudioApp {
             self.stop_tx = None;
         }
 
-        if let Some(urx) = &self.update_rx
-            && let Ok(res) = urx.try_recv()
-        {
-            self.update_rx = None;
-            match res {
-                Ok((tag, url)) => {
-                    if parse_semver(&tag) > parse_semver(APP_VERSION) {
-                        self.push_log(format!("Update available: {tag} -> {url}"), LogLevel::Warn);
-                        self.update_state = UpdateState::Available { tag, url };
+        // 2. Xray Core Manager Messages
+        let mut xray_msgs = Vec::new();
+        while let Ok(msg) = self.xray_rx.try_recv() {
+            xray_msgs.push(msg);
+        }
+        for msg in xray_msgs {
+            match msg {
+                XrayMsg::VersionDetected(ver) => {
+                    self.xray_detecting = false;
+                    self.xray_version = ver;
+                }
+                XrayMsg::CheckResult(Ok(info)) => {
+                    let latest_disp = format_version_tag(&info.tag);
+                    let needs_update = match &self.xray_version {
+                        Some(curr) => is_newer_version(&info.tag, curr),
+                        None => true,
+                    };
+                    if !self.xray_path.exists() || needs_update {
+                        self.push_log(
+                            format!("Xray Core update available: {latest_disp}"),
+                            LogLevel::Warn,
+                        );
+                        self.xray_state = XrayUpdateState::Available(info);
+                    } else {
+                        self.push_log(
+                            format!("Xray Core is up to date ({latest_disp})."),
+                            LogLevel::Info,
+                        );
+                        self.xray_state = XrayUpdateState::UpToDate(latest_disp);
+                    }
+                }
+                XrayMsg::CheckResult(Err(e)) => {
+                    self.push_log(format!("Xray update check failed: {e}"), LogLevel::Warn);
+                    self.xray_state = XrayUpdateState::Error(e);
+                }
+                XrayMsg::Progress { stage, progress } => {
+                    self.xray_state = XrayUpdateState::Installing { stage, progress };
+                }
+                XrayMsg::InstallDone { path, tag } => {
+                    self.xray_path = path.clone();
+                    self.push_log(
+                        format!("Xray Core {tag} installed cleanly at {}", path.display()),
+                        LogLevel::Pass,
+                    );
+                    self.xray_state = XrayUpdateState::Installed(tag);
+                    self.trigger_xray_version_detect();
+                }
+                XrayMsg::InstallFailed(e) => {
+                    self.push_log(format!("Xray Core install failed: {e}"), LogLevel::Fail);
+                    self.xray_state = XrayUpdateState::Error(e);
+                }
+            }
+        }
+
+        // 3. CipherForge App Self-Updater Messages
+        let mut app_msgs = Vec::new();
+        while let Ok(msg) = self.app_update_rx.try_recv() {
+            app_msgs.push(msg);
+        }
+        for msg in app_msgs {
+            match msg {
+                AppUpdateMsg::CheckResult(Ok(info)) => {
+                    if is_newer_version(&info.tag, APP_VERSION) {
+                        self.push_log(
+                            format!("CipherForge update available: {} -> {}", info.tag, info.html_url),
+                            LogLevel::Warn,
+                        );
+                        self.app_update_state = AppUpdateState::Available(info);
                     } else {
                         self.push_log(
                             format!("CipherForge is up to date (v{APP_VERSION})."),
                             LogLevel::Info,
                         );
-                        self.update_state = UpdateState::UpToDate(tag);
+                        self.app_update_state =
+                            AppUpdateState::UpToDate(format_version_tag(&info.tag));
                     }
                 }
-                Err(e) => {
-                    self.push_log(format!("Update check failed: {e}"), LogLevel::Warn);
-                    self.update_state = UpdateState::Error(e);
+                AppUpdateMsg::CheckResult(Err(e)) => {
+                    self.push_log(format!("App update check failed: {e}"), LogLevel::Warn);
+                    self.app_update_state = AppUpdateState::Error(e);
+                }
+                AppUpdateMsg::Progress { stage, progress } => {
+                    self.app_update_state = AppUpdateState::Updating { stage, progress };
+                }
+                AppUpdateMsg::ReadyToRestart(exe_path) => {
+                    self.push_log(
+                        "CipherForge updated successfully. Restarting...",
+                        LogLevel::Pass,
+                    );
+                    let mut cmd = std::process::Command::new(&exe_path);
+                    if let Some(dir) = exe_path.parent() {
+                        cmd.current_dir(dir);
+                    }
+                    match cmd.spawn() {
+                        Ok(_) => std::process::exit(0),
+                        Err(e) => {
+                            self.app_update_state = AppUpdateState::Error(format!(
+                                "Updated on disk, but auto-restart failed ({e}). Please reopen CipherForge manually."
+                            ));
+                        }
+                    }
+                }
+                AppUpdateMsg::Failed(e) => {
+                    self.push_log(format!("CipherForge self-update failed: {e}"), LogLevel::Fail);
+                    self.app_update_state = AppUpdateState::Error(e);
                 }
             }
         }
@@ -2088,9 +2856,13 @@ impl CipherStudioApp {
     fn start_scan(&mut self) {
         if !self.xray_path.exists() {
             self.push_log(
-                format!("Xray binary not found at: {}", self.xray_path.display()),
+                format!(
+                    "Xray binary not found at: {}. Open Xray Core Manager to download or select it.",
+                    self.xray_path.display()
+                ),
                 LogLevel::Fail,
             );
+            self.show_xray_modal = true;
             return;
         }
         let (base_cfg, summary) = match parse_proxy_input(&self.proxy_input) {
@@ -2194,6 +2966,19 @@ impl CipherStudioApp {
         list
     }
 
+    fn has_active_background_work(&self) -> bool {
+        self.is_running
+            || self.xray_detecting
+            || matches!(
+                self.xray_state,
+                XrayUpdateState::Checking | XrayUpdateState::Installing { .. }
+            )
+            || matches!(
+                self.app_update_state,
+                AppUpdateState::Checking | AppUpdateState::Updating { .. }
+            )
+    }
+
     // ================= Reusable UI Building Blocks =================
     fn card_frame() -> egui::Frame {
         egui::Frame {
@@ -2202,6 +2987,31 @@ impl CipherStudioApp {
             corner_radius: egui::CornerRadius::same(10),
             inner_margin: egui::Margin::symmetric(14, 11),
             ..Default::default()
+        }
+    }
+
+    fn modal_section_frame() -> egui::Frame {
+        egui::Frame {
+            fill: BG_INPUT,
+            stroke: egui::Stroke::new(1.0, BORDER_CLR),
+            corner_radius: egui::CornerRadius::same(8),
+            inner_margin: egui::Margin::symmetric(12, 10),
+            ..Default::default()
+        }
+    }
+
+    fn draw_progress_bar(ui: &mut egui::Ui, progress: f32, fill_color: egui::Color32, height: f32) {
+        let bar_w = ui.available_width();
+        let (bar_rect, _) =
+            ui.allocate_exact_size(egui::vec2(bar_w, height), egui::Sense::hover());
+        ui.painter()
+            .rect_filled(bar_rect, egui::CornerRadius::same(4), BG_ELEVATED);
+        let pct = progress.clamp(0.0, 1.0);
+        if pct > 0.0 {
+            let mut fill_rect = bar_rect;
+            fill_rect.set_width((bar_rect.width() * pct).max(10.0));
+            ui.painter()
+                .rect_filled(fill_rect, egui::CornerRadius::same(4), fill_color);
         }
     }
 
@@ -2359,7 +3169,7 @@ impl CipherStudioApp {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.spacing_mut().item_spacing.x = 8.0;
 
-                    // Tight status pill (note: right_to_left places label first on right, dot on left => "● IDLE")
+                    // Tight status pill (right_to_left places label on right, dot on left => "● IDLE")
                     let (st_bg, st_border, st_dot, st_fg) = match self.status_label.as_str() {
                         "RUNNING" => (EMERALD_SOFT, EMERALD, EMERALD_HI, EMERALD_HI),
                         "STOPPING..." => (BG_ELEVATED, AMBER, AMBER, AMBER),
@@ -2387,9 +3197,25 @@ impl CipherStudioApp {
                         });
                     });
 
-                    if ui.button("About").clicked() {
+                    // About / App Update button
+                    let app_has_update =
+                        matches!(self.app_update_state, AppUpdateState::Available(_));
+                    let about_btn = if app_has_update {
+                        egui::Button::new(
+                            egui::RichText::new("Update Available")
+                                .size(12.5)
+                                .color(AMBER)
+                                .strong(),
+                        )
+                        .fill(AMBER_SOFT)
+                        .stroke(egui::Stroke::new(1.0, AMBER))
+                    } else {
+                        egui::Button::new("About")
+                    };
+                    if ui.add(about_btn).clicked() {
                         self.show_about = true;
                     }
+
                     if ui.button("GitHub").clicked() {
                         ui.ctx()
                             .open_url(egui::OpenUrl::new_tab(GITHUB_REPO_URL));
@@ -2404,26 +3230,69 @@ impl CipherStudioApp {
                         self.hide_settings = !self.hide_settings;
                     }
 
+                    // Xray Core Manager status pill button
                     let xray_ok = self.xray_path.exists();
-                    let (x_text, x_clr, x_fill) = if xray_ok {
-                        ("Xray: Ready", EMERALD_HI, EMERALD_SOFT)
+                    let xray_has_update =
+                        matches!(self.xray_state, XrayUpdateState::Available(_));
+                    let xray_installing =
+                        matches!(self.xray_state, XrayUpdateState::Installing { .. });
+
+                    let (x_text, x_clr, x_fill, x_stroke) = if xray_installing {
+                        (
+                            "Xray: Updating...".to_string(),
+                            SKY,
+                            INDIGO_SOFT,
+                            INDIGO,
+                        )
+                    } else if !xray_ok {
+                        (
+                            "Xray Missing".to_string(),
+                            ROSE_HI,
+                            ROSE_SOFT,
+                            ROSE,
+                        )
+                    } else if xray_has_update {
+                        let v_part = self
+                            .xray_version
+                            .as_deref()
+                            .unwrap_or("Ready");
+                        (
+                            format!("Xray {v_part} • Update"),
+                            AMBER,
+                            AMBER_SOFT,
+                            AMBER,
+                        )
+                    } else if let Some(ver) = &self.xray_version {
+                        (
+                            format!("Xray {ver}"),
+                            EMERALD_HI,
+                            EMERALD_SOFT,
+                            EMERALD,
+                        )
                     } else {
-                        ("Pick xray.exe", ROSE_HI, ROSE_SOFT)
+                        (
+                            "Xray: Ready".to_string(),
+                            EMERALD_HI,
+                            EMERALD_SOFT,
+                            EMERALD,
+                        )
                     };
+
                     let x_btn = egui::Button::new(
                         egui::RichText::new(x_text)
                             .size(12.5)
                             .color(x_clr)
                             .strong(),
                     )
-                    .fill(x_fill);
-                    let x_resp = ui
-                        .add(x_btn)
-                        .on_hover_text(format!("Xray path: {}", self.xray_path.display()));
-                    if x_resp.clicked()
-                        && let Some(p) = rfd::FileDialog::new().pick_file()
-                    {
-                        self.xray_path = p;
+                    .fill(x_fill)
+                    .stroke(egui::Stroke::new(1.0, x_stroke));
+
+                    let x_resp = ui.add(x_btn).on_hover_text(format!(
+                        "Xray Core Manager\nPath: {}\nClick to check updates, download core, or change path.",
+                        self.xray_path.display()
+                    ));
+                    if x_resp.clicked() {
+                        self.show_xray_modal = true;
                     }
                 });
             });
@@ -3037,20 +3906,7 @@ impl CipherStudioApp {
             });
 
             ui.add_space(9.0);
-
-            // Smooth rounded progress bar
-            let bar_w = ui.available_width();
-            let (bar_rect, _) =
-                ui.allocate_exact_size(egui::vec2(bar_w, 7.0), egui::Sense::hover());
-            ui.painter()
-                .rect_filled(bar_rect, egui::CornerRadius::same(4), BG_INPUT);
-            let pct = self.progress_pct.clamp(0.0, 1.0);
-            if pct > 0.0 {
-                let mut fill_rect = bar_rect;
-                fill_rect.set_width((bar_rect.width() * pct).max(10.0));
-                ui.painter()
-                    .rect_filled(fill_rect, egui::CornerRadius::same(4), EMERALD);
-            }
+            Self::draw_progress_bar(ui, self.progress_pct, EMERALD, 7.0);
         });
 
         ui.add_space(2.0);
@@ -3389,19 +4245,431 @@ impl CipherStudioApp {
         });
     }
 
+    // ================= Xray Core Manager Modal =================
+    fn draw_xray_window(&mut self, ctx: &egui::Context) {
+        if !self.show_xray_modal {
+            return;
+        }
+        let mut open = self.show_xray_modal;
+        let mut req_check = false;
+        let mut req_install: Option<Option<ReleaseInfo>> = None;
+        let mut req_dismiss = false;
+        let mut req_browse = false;
+        let mut req_refresh = false;
+
+        egui::Window::new("Xray Core Manager")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .fixed_size([520.0, 365.0])
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                let exists = self.xray_path.exists();
+                let busy = matches!(
+                    self.xray_state,
+                    XrayUpdateState::Checking | XrayUpdateState::Installing { .. }
+                );
+
+                // Top subtitle & repo link
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("Compatible Core Source:")
+                            .size(12.5)
+                            .color(FG_MUTED),
+                    );
+                    ui.hyperlink_to("patterniha/Xray-core", XRAY_FORK_URL);
+                });
+
+                ui.add_space(6.0);
+
+                // ---- Section 1: Installed Core Status & Path ----
+                Self::modal_section_frame().show(ui, |ui| {
+                    ui.set_min_width(ui.available_width());
+                    ui.spacing_mut().item_spacing.y = 7.0;
+
+                    ui.horizontal(|ui| {
+                        Self::draw_section_title(ui, "INSTALLED CORE", SKY);
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let (badge_bg, badge_fg, badge_txt) = if exists {
+                                (EMERALD_SOFT, EMERALD_HI, "Ready")
+                            } else {
+                                (ROSE_SOFT, ROSE_HI, "Not Found")
+                            };
+                            egui::Frame {
+                                fill: badge_bg,
+                                stroke: egui::Stroke::NONE,
+                                corner_radius: egui::CornerRadius::same(5),
+                                inner_margin: egui::Margin::symmetric(8, 2),
+                                ..Default::default()
+                            }
+                            .show(ui, |ui| {
+                                ui.label(
+                                    egui::RichText::new(badge_txt)
+                                        .size(11.5)
+                                        .color(badge_fg)
+                                        .strong(),
+                                );
+                            });
+                        });
+                    });
+
+                    // Version row
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new("Core Version:")
+                                .size(12.5)
+                                .color(FG_MUTED),
+                        );
+                        let (ver_txt, ver_clr) = if !exists {
+                            ("Not installed".to_string(), ROSE_HI)
+                        } else if self.xray_detecting {
+                            ("Detecting...".to_string(), SKY)
+                        } else if let Some(v) = &self.xray_version {
+                            (v.clone(), EMERALD_HI)
+                        } else {
+                            ("Unknown (custom binary)".to_string(), AMBER)
+                        };
+                        ui.label(egui::RichText::new(ver_txt).size(13.0).color(ver_clr).strong());
+                    });
+
+                    // Path display + Browse / Refresh buttons
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new("Binary Path:")
+                                .size(12.5)
+                                .color(FG_MUTED),
+                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.spacing_mut().item_spacing.x = 6.0;
+                            if ui
+                                .add_enabled(!busy && exists, egui::Button::new("Refresh"))
+                                .clicked()
+                            {
+                                req_refresh = true;
+                            }
+                            if ui
+                                .add_enabled(!busy && !self.is_running, egui::Button::new("Browse..."))
+                                .clicked()
+                            {
+                                req_browse = true;
+                            }
+                        });
+                    });
+
+                    egui::Frame {
+                        fill: BG_CARD,
+                        stroke: egui::Stroke::new(1.0, BORDER_CLR),
+                        corner_radius: egui::CornerRadius::same(6),
+                        inner_margin: egui::Margin::symmetric(9, 6),
+                        ..Default::default()
+                    }
+                    .show(ui, |ui| {
+                        ui.set_min_width(ui.available_width());
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(self.xray_path.display().to_string())
+                                    .monospace()
+                                    .size(11.5)
+                                    .color(FG_SECONDARY),
+                            )
+                            .wrap(),
+                        );
+                    });
+                });
+
+                ui.add_space(8.0);
+
+                // ---- Section 2: Download & Auto-Update ----
+                Self::modal_section_frame().show(ui, |ui| {
+                    ui.set_min_width(ui.available_width());
+                    ui.spacing_mut().item_spacing.y = 8.0;
+
+                    Self::draw_section_title(ui, "DOWNLOAD & UPDATES", EMERALD);
+
+                    if self.is_running {
+                        egui::Frame {
+                            fill: AMBER_SOFT,
+                            stroke: egui::Stroke::new(1.0, AMBER),
+                            corner_radius: egui::CornerRadius::same(6),
+                            inner_margin: egui::Margin::symmetric(9, 6),
+                            ..Default::default()
+                        }
+                        .show(ui, |ui| {
+                            ui.set_min_width(ui.available_width());
+                            ui.label(
+                                egui::RichText::new(
+                                    "Stop the active scan before downloading or updating Xray Core.",
+                                )
+                                .size(12.0)
+                                .color(AMBER),
+                            );
+                        });
+                    }
+
+                    // Primary action row
+                    if !exists {
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(format!(
+                                    "No {} binary found. Download the latest compatible build directly (extracts {} only and deletes the ZIP).",
+                                    xray_bin_name(),
+                                    xray_bin_name()
+                                ))
+                                .size(12.0)
+                                .color(FG_SECONDARY),
+                            )
+                            .wrap(),
+                        );
+
+                        ui.horizontal(|ui| {
+                            let dl_btn = egui::Button::new(
+                                egui::RichText::new("Download Latest Xray Core")
+                                    .size(13.0)
+                                    .color(BG_MAIN)
+                                    .strong(),
+                            )
+                            .fill(EMERALD)
+                            .min_size(egui::vec2(196.0, 32.0));
+                            if ui.add_enabled(!busy && !self.is_running, dl_btn).clicked() {
+                                req_install = Some(None);
+                            }
+
+                            if ui
+                                .add_enabled(!busy, egui::Button::new("Check Latest Version"))
+                                .clicked()
+                            {
+                                req_check = true;
+                            }
+                        });
+                    } else {
+                        ui.horizontal(|ui| {
+                            let chk_btn = egui::Button::new(
+                                egui::RichText::new("Check for Updates")
+                                    .size(12.5)
+                                    .color(FG_TEXT)
+                                    .strong(),
+                            )
+                            .fill(INDIGO)
+                            .min_size(egui::vec2(150.0, 30.0));
+                            if ui.add_enabled(!busy, chk_btn).clicked() {
+                                req_check = true;
+                            }
+
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "Extracts {} only • auto-cleans ZIP",
+                                    xray_bin_name()
+                                ))
+                                .size(11.5)
+                                .color(FG_MUTED),
+                            );
+                        });
+                    }
+
+                    // Dynamic state area
+                    match &self.xray_state {
+                        XrayUpdateState::Idle => {}
+                        XrayUpdateState::Checking => {
+                            ui.label(
+                                egui::RichText::new("Checking GitHub releases for patterniha/Xray-core...")
+                                    .size(12.0)
+                                    .color(SKY),
+                            );
+                        }
+                        XrayUpdateState::UpToDate(tag) => {
+                            egui::Frame {
+                                fill: EMERALD_SOFT,
+                                stroke: egui::Stroke::NONE,
+                                corner_radius: egui::CornerRadius::same(6),
+                                inner_margin: egui::Margin::symmetric(10, 7),
+                                ..Default::default()
+                            }
+                            .show(ui, |ui| {
+                                ui.set_min_width(ui.available_width());
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "Xray Core is up to date ({tag})."
+                                    ))
+                                    .size(12.5)
+                                    .color(EMERALD_HI)
+                                    .strong(),
+                                );
+                            });
+                        }
+                        XrayUpdateState::Available(info) => {
+                            let latest_tag = format_version_tag(&info.tag);
+                            let curr_disp = self
+                                .xray_version
+                                .as_deref()
+                                .unwrap_or("Not installed");
+                            let asset_disp = info
+                                .asset_name
+                                .as_deref()
+                                .unwrap_or(xray_expected_asset_name());
+
+                            egui::Frame {
+                                fill: AMBER_SOFT,
+                                stroke: egui::Stroke::new(1.0, AMBER),
+                                corner_radius: egui::CornerRadius::same(7),
+                                inner_margin: egui::Margin::symmetric(10, 8),
+                                ..Default::default()
+                            }
+                            .show(ui, |ui| {
+                                ui.set_min_width(ui.available_width());
+                                ui.spacing_mut().item_spacing.y = 5.0;
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "Update available: {curr_disp}  →  {latest_tag}"
+                                    ))
+                                    .size(13.0)
+                                    .color(AMBER)
+                                    .strong(),
+                                );
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "Package: {asset_disp}  •  Extracts {} only & deletes ZIP",
+                                        xray_bin_name()
+                                    ))
+                                    .size(11.5)
+                                    .color(FG_SECONDARY),
+                                );
+                                ui.add_space(2.0);
+                                ui.horizontal(|ui| {
+                                    let confirm_btn = egui::Button::new(
+                                        egui::RichText::new("Confirm & Install Update")
+                                            .size(12.5)
+                                            .color(BG_MAIN)
+                                            .strong(),
+                                    )
+                                    .fill(EMERALD);
+                                    if ui
+                                        .add_enabled(
+                                            !self.is_running && info.download_url.is_some(),
+                                            confirm_btn,
+                                        )
+                                        .clicked()
+                                    {
+                                        req_install = Some(Some(info.clone()));
+                                    }
+
+                                    if ui.button("Cancel").clicked() {
+                                        req_dismiss = true;
+                                    }
+                                });
+                            });
+                        }
+                        XrayUpdateState::Installing { stage, progress } => {
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    egui::RichText::new(stage)
+                                        .size(12.0)
+                                        .color(SKY),
+                                );
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        ui.label(
+                                            egui::RichText::new(format!(
+                                                "{}%",
+                                                (progress.clamp(0.0, 1.0) * 100.0).round() as u32
+                                            ))
+                                            .size(12.0)
+                                            .color(EMERALD_HI)
+                                            .strong(),
+                                        );
+                                    },
+                                );
+                            });
+                            Self::draw_progress_bar(ui, *progress, EMERALD, 7.0);
+                        }
+                        XrayUpdateState::Installed(tag) => {
+                            egui::Frame {
+                                fill: EMERALD_SOFT,
+                                stroke: egui::Stroke::NONE,
+                                corner_radius: egui::CornerRadius::same(6),
+                                inner_margin: egui::Margin::symmetric(10, 7),
+                                ..Default::default()
+                            }
+                            .show(ui, |ui| {
+                                ui.set_min_width(ui.available_width());
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "Xray Core {tag} installed cleanly and ZIP removed!"
+                                    ))
+                                    .size(12.5)
+                                    .color(EMERALD_HI)
+                                    .strong(),
+                                );
+                            });
+                        }
+                        XrayUpdateState::Error(e) => {
+                            egui::Frame {
+                                fill: ROSE_SOFT,
+                                stroke: egui::Stroke::NONE,
+                                corner_radius: egui::CornerRadius::same(6),
+                                inner_margin: egui::Margin::symmetric(10, 7),
+                                ..Default::default()
+                            }
+                            .show(ui, |ui| {
+                                ui.set_min_width(ui.available_width());
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(e)
+                                            .size(12.0)
+                                            .color(ROSE_HI),
+                                    )
+                                    .wrap(),
+                                );
+                            });
+                        }
+                    }
+                });
+            });
+
+        self.show_xray_modal = open;
+
+        if req_browse && let Some(p) = rfd::FileDialog::new().pick_file() {
+            self.xray_path = p;
+            self.xray_state = XrayUpdateState::Idle;
+            self.trigger_xray_version_detect();
+        }
+        if req_refresh {
+            self.trigger_xray_version_detect();
+        }
+        if req_check {
+            self.trigger_xray_update_check();
+        }
+        if let Some(rel) = req_install {
+            self.trigger_xray_install(rel);
+        }
+        if req_dismiss {
+            self.xray_state = XrayUpdateState::Idle;
+        }
+    }
+
+    // ================= About & App Self-Update Modal =================
     fn draw_about_window(&mut self, ctx: &egui::Context) {
         if !self.show_about {
             return;
         }
         let mut open = self.show_about;
-        egui::Window::new("About CipherForge")
+        let mut req_check = false;
+        let mut req_update_url: Option<String> = None;
+        let mut req_dismiss = false;
+
+        egui::Window::new("About & Updates")
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
-            .fixed_size([470.0, 275.0])
+            .fixed_size([520.0, 360.0])
             .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
             .show(ctx, |ui| {
-                ui.add_space(4.0);
+                let busy = matches!(
+                    self.app_update_state,
+                    AppUpdateState::Checking | AppUpdateState::Updating { .. }
+                );
+
+                // App header
                 ui.horizontal(|ui| {
                     ui.label(
                         egui::RichText::new("CipherForge")
@@ -3409,12 +4677,21 @@ impl CipherStudioApp {
                             .color(FG_TEXT)
                             .strong(),
                     );
-                    ui.label(
-                        egui::RichText::new(format!("v{APP_VERSION}"))
-                            .size(13.0)
-                            .color(SKY)
-                            .strong(),
-                    );
+                    egui::Frame {
+                        fill: INDIGO_SOFT,
+                        stroke: egui::Stroke::new(1.0, INDIGO),
+                        corner_radius: egui::CornerRadius::same(6),
+                        inner_margin: egui::Margin::symmetric(7, 2),
+                        ..Default::default()
+                    }
+                    .show(ui, |ui| {
+                        ui.label(
+                            egui::RichText::new(format!("v{APP_VERSION}"))
+                                .size(12.0)
+                                .color(SKY)
+                                .strong(),
+                        );
+                    });
                 });
                 ui.label(
                     egui::RichText::new(
@@ -3423,102 +4700,235 @@ impl CipherStudioApp {
                     .size(12.5)
                     .color(FG_MUTED),
                 );
-                ui.add_space(10.0);
-                ui.separator();
+
                 ui.add_space(8.0);
 
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("Project Repository:").color(FG_SECONDARY));
-                    ui.hyperlink_to("github.com/NetForgeDev/CipherForge", GITHUB_REPO_URL);
-                });
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("Releases & Downloads:").color(FG_SECONDARY));
-                    ui.hyperlink_to("Latest Portable Releases", GITHUB_RELEASES_URL);
-                });
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("Compatible Xray Core:").color(FG_SECONDARY));
-                    ui.hyperlink_to("patterniha/Xray-core", XRAY_FORK_URL);
+                // Links Card
+                Self::modal_section_frame().show(ui, |ui| {
+                    ui.set_min_width(ui.available_width());
+                    ui.spacing_mut().item_spacing.y = 5.0;
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("Project Repository:").color(FG_SECONDARY));
+                        ui.hyperlink_to("github.com/NetForgeDev/CipherForge", GITHUB_REPO_URL);
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("Releases & Downloads:").color(FG_SECONDARY));
+                        ui.hyperlink_to("Latest Portable Releases", GITHUB_RELEASES_URL);
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("Compatible Xray Core:").color(FG_SECONDARY));
+                        ui.hyperlink_to("patterniha/Xray-core", XRAY_FORK_URL);
+                    });
                 });
 
-                ui.add_space(14.0);
-                ui.horizontal(|ui| {
-                    let checking = matches!(self.update_state, UpdateState::Checking);
-                    if ui
-                        .add_enabled(
-                            !checking,
-                            egui::Button::new(
-                                egui::RichText::new("Check for Updates")
-                                    .color(FG_TEXT)
-                                    .strong(),
-                            )
-                            .fill(INDIGO),
-                        )
-                        .clicked()
-                    {
-                        self.trigger_update_check();
+                ui.add_space(8.0);
+
+                // Self-Update Card
+                Self::modal_section_frame().show(ui, |ui| {
+                    ui.set_min_width(ui.available_width());
+                    ui.spacing_mut().item_spacing.y = 8.0;
+
+                    Self::draw_section_title(ui, "APPLICATION UPDATES", INDIGO);
+
+                    if self.is_running {
+                        egui::Frame {
+                            fill: AMBER_SOFT,
+                            stroke: egui::Stroke::new(1.0, AMBER),
+                            corner_radius: egui::CornerRadius::same(6),
+                            inner_margin: egui::Margin::symmetric(9, 6),
+                            ..Default::default()
+                        }
+                        .show(ui, |ui| {
+                            ui.set_min_width(ui.available_width());
+                            ui.label(
+                                egui::RichText::new(
+                                    "Stop the active scan before installing an application update.",
+                                )
+                                .size(12.0)
+                                .color(AMBER),
+                            );
+                        });
                     }
 
-                    match &self.update_state {
-                        UpdateState::Idle => {
+                    ui.horizontal(|ui| {
+                        let chk_btn = egui::Button::new(
+                            egui::RichText::new("Check for Updates")
+                                .size(12.5)
+                                .color(FG_TEXT)
+                                .strong(),
+                        )
+                        .fill(INDIGO)
+                        .min_size(egui::vec2(150.0, 30.0));
+                        if ui.add_enabled(!busy, chk_btn).clicked() {
+                            req_check = true;
+                        }
+
+                        if matches!(self.app_update_state, AppUpdateState::Idle) {
                             ui.label(
-                                egui::RichText::new("Click to check GitHub for updates.")
-                                    .color(FG_MUTED)
-                                    .size(12.0),
+                                egui::RichText::new("Checks GitHub & supports 1-click auto-update.")
+                                    .size(11.5)
+                                    .color(FG_MUTED),
                             );
                         }
-                        UpdateState::Checking => {
+                    });
+
+                    match &self.app_update_state {
+                        AppUpdateState::Idle => {}
+                        AppUpdateState::Checking => {
                             ui.label(
-                                egui::RichText::new("Checking GitHub API...")
-                                    .color(SKY)
-                                    .size(12.0),
-                            );
-                        }
-                        UpdateState::UpToDate(tag) => {
-                            ui.label(
-                                egui::RichText::new(format!("Up to date ({tag})"))
-                                    .color(EMERALD_HI)
+                                egui::RichText::new("Checking GitHub API for latest release...")
                                     .size(12.0)
-                                    .strong(),
+                                    .color(SKY),
                             );
                         }
-                        UpdateState::Available { tag, url } => {
-                            ui.label(
-                                egui::RichText::new(format!("New version: {tag}!"))
-                                    .color(AMBER)
-                                    .size(12.0)
-                                    .strong(),
-                            );
-                            if ui
-                                .add(
-                                    egui::Button::new(
-                                        egui::RichText::new("Download")
-                                            .color(BG_MAIN)
-                                            .strong(),
-                                    )
-                                    .fill(EMERALD),
-                                )
-                                .clicked()
-                            {
-                                ui.ctx().open_url(egui::OpenUrl::new_tab(url));
+                        AppUpdateState::UpToDate(tag) => {
+                            egui::Frame {
+                                fill: EMERALD_SOFT,
+                                stroke: egui::Stroke::NONE,
+                                corner_radius: egui::CornerRadius::same(6),
+                                inner_margin: egui::Margin::symmetric(10, 7),
+                                ..Default::default()
                             }
+                            .show(ui, |ui| {
+                                ui.set_min_width(ui.available_width());
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "CipherForge is up to date ({tag})."
+                                    ))
+                                    .size(12.5)
+                                    .color(EMERALD_HI)
+                                    .strong(),
+                                );
+                            });
                         }
-                        UpdateState::Error(e) => {
-                            ui.label(egui::RichText::new(e).color(ROSE_HI).size(12.0));
+                        AppUpdateState::Available(info) => {
+                            let latest_tag = format_version_tag(&info.tag);
+                            let asset_disp = info
+                                .asset_name
+                                .as_deref()
+                                .unwrap_or("Release ZIP");
+
+                            egui::Frame {
+                                fill: AMBER_SOFT,
+                                stroke: egui::Stroke::new(1.0, AMBER),
+                                corner_radius: egui::CornerRadius::same(7),
+                                inner_margin: egui::Margin::symmetric(10, 8),
+                                ..Default::default()
+                            }
+                            .show(ui, |ui| {
+                                ui.set_min_width(ui.available_width());
+                                ui.spacing_mut().item_spacing.y = 5.0;
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "New version available: v{APP_VERSION}  →  {latest_tag}"
+                                    ))
+                                    .size(13.0)
+                                    .color(AMBER)
+                                    .strong(),
+                                );
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "Package: {asset_disp}  •  Downloads, replaces binary & restarts automatically"
+                                    ))
+                                    .size(11.5)
+                                    .color(FG_SECONDARY),
+                                );
+                                ui.add_space(2.0);
+                                ui.horizontal(|ui| {
+                                    if let Some(dl_url) = &info.download_url {
+                                        let upd_btn = egui::Button::new(
+                                            egui::RichText::new("Confirm & Update Now")
+                                                .size(12.5)
+                                                .color(BG_MAIN)
+                                                .strong(),
+                                        )
+                                        .fill(EMERALD);
+                                        if ui
+                                            .add_enabled(!self.is_running, upd_btn)
+                                            .clicked()
+                                        {
+                                            req_update_url = Some(dl_url.clone());
+                                        }
+                                    }
+                                    if ui.button("Release Page").clicked() {
+                                        ui.ctx().open_url(egui::OpenUrl::new_tab(&info.html_url));
+                                    }
+                                    if ui.button("Cancel").clicked() {
+                                        req_dismiss = true;
+                                    }
+                                });
+                            });
+                        }
+                        AppUpdateState::Updating { stage, progress } => {
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    egui::RichText::new(stage)
+                                        .size(12.0)
+                                        .color(SKY),
+                                );
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        ui.label(
+                                            egui::RichText::new(format!(
+                                                "{}%",
+                                                (progress.clamp(0.0, 1.0) * 100.0).round() as u32
+                                            ))
+                                            .size(12.0)
+                                            .color(EMERALD_HI)
+                                            .strong(),
+                                        );
+                                    },
+                                );
+                            });
+                            Self::draw_progress_bar(ui, *progress, INDIGO, 7.0);
+                        }
+                        AppUpdateState::Error(e) => {
+                            egui::Frame {
+                                fill: ROSE_SOFT,
+                                stroke: egui::Stroke::NONE,
+                                corner_radius: egui::CornerRadius::same(6),
+                                inner_margin: egui::Margin::symmetric(10, 7),
+                                ..Default::default()
+                            }
+                            .show(ui, |ui| {
+                                ui.set_min_width(ui.available_width());
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(e)
+                                            .size(12.0)
+                                            .color(ROSE_HI),
+                                    )
+                                    .wrap(),
+                                );
+                            });
                         }
                     }
                 });
             });
+
         self.show_about = open;
+
+        if req_check {
+            self.trigger_app_update_check();
+        }
+        if let Some(url) = req_update_url {
+            self.trigger_app_self_update(url);
+        }
+        if req_dismiss {
+            self.app_update_state = AppUpdateState::Idle;
+        }
     }
 }
 
 impl eframe::App for CipherStudioApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        self.poll_worker();
-        if self.is_running || matches!(self.update_state, UpdateState::Checking) {
+        self.poll_background_tasks();
+        if self.has_active_background_work() {
             ui.ctx().request_repaint_after(Duration::from_millis(80));
         }
 
+        self.draw_xray_window(ui.ctx());
         self.draw_about_window(ui.ctx());
 
         egui::CentralPanel::default()
@@ -3568,6 +4978,8 @@ impl eframe::App for CipherStudioApp {
 }
 
 fn main() -> eframe::Result<()> {
+    cleanup_old_self_update_binary();
+
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([1260.0, 840.0])
         .with_min_inner_size([980.0, 680.0]);
@@ -3588,4 +5000,3 @@ fn main() -> eframe::Result<()> {
         Box::new(|cc| Ok(Box::new(CipherStudioApp::new(cc)))),
     )
 }
-// CipherForge
